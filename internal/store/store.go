@@ -65,6 +65,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("初始化数据库结构失败: %w", err)
 	}
+	if err := s.ensureRepoColumns(ctx); err != nil {
+		return fmt.Errorf("升级仓库状态结构失败: %w", err)
+	}
 	now := dbTime(time.Now())
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -79,13 +82,69 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("初始化默认标签失败: %w", err)
 		}
 	}
+	if err := seedDefaultActions(ctx, tx, now); err != nil {
+		return fmt.Errorf("初始化默认操作失败: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO meta (key, value) VALUES ('schema_version', '1')
+		`INSERT INTO meta (key, value) VALUES ('schema_version', '3')
 		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
 	); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE agent_runs SET status = 'failed', error = '服务重启，任务已中断', finished_at = ?
+		 WHERE status IN ('queued', 'preparing', 'running')`, now,
+	); err != nil {
+		return fmt.Errorf("清理中断的 Agent 任务失败: %w", err)
+	}
 	return tx.Commit()
+}
+
+func (s *Store) ensureRepoColumns(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(repos)`)
+	if err != nil {
+		return err
+	}
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var (
+			cid          int
+			name         string
+			columnType   string
+			notNull      int
+			defaultValue sql.NullString
+			primaryKey   int
+		)
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return err
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	for _, column := range []string{
+		"tracked_branch",
+		"commit_sha",
+		"commit_message",
+		"commit_committed_at",
+	} {
+		if columns[column] {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx,
+			`ALTER TABLE repos ADD COLUMN `+column+` TEXT NOT NULL DEFAULT ''`,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) ApplyRepoSnapshot(ctx context.Context, repo string, items []GitHubItem, closeMissing bool, boundary time.Time) (int, error) {
@@ -146,6 +205,12 @@ func upsertItem(ctx context.Context, tx *sql.Tx, repo string, item GitHubItem, n
 		return fmt.Errorf("读取条目失败 %s#%d: %w", repo, item.Number, err)
 	}
 
+	metadata := []byte("{}")
+	if item.PR != nil {
+		if encoded, err := json.Marshal(item.PR); err == nil {
+			metadata = encoded
+		}
+	}
 	createdAt := nullableTime(item.CreatedAt)
 	updatedAt := nullableTime(item.UpdatedAt)
 	closedAt := nullableOptionalTime(item.ClosedAt)
@@ -161,12 +226,12 @@ func upsertItem(ctx context.Context, tx *sql.Tx, repo string, item GitHubItem, n
 				source, repo, number, kind, title, url, state, is_draft, author, body,
 				labels_json, assignees_json, reviewers_json, milestone, review_decision,
 				ci_status, mergeable, comments_count, created_at, updated_at, closed_at,
-				merged_at, first_seen_at, last_seen_at, synced_at
-			) VALUES ('github', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				merged_at, first_seen_at, last_seen_at, synced_at, metadata
+			) VALUES ('github', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			repo, item.Number, item.Kind, item.Title, item.URL, item.State, draft, item.Author, item.Body,
 			string(labelsJSON), string(assigneesJSON), string(reviewersJSON), item.Milestone,
 			item.ReviewDecision, item.CIStatus, item.Mergeable, item.Comments, createdAt, updatedAt,
-			closedAt, mergedAt, dbTime(now), dbTime(now), dbTime(now),
+			closedAt, mergedAt, dbTime(now), dbTime(now), dbTime(now), string(metadata),
 		)
 		if err != nil {
 			return fmt.Errorf("插入条目失败 %s#%d: %w", repo, item.Number, err)
@@ -180,12 +245,12 @@ func upsertItem(ctx context.Context, tx *sql.Tx, repo string, item GitHubItem, n
 			labels_json = ?, assignees_json = ?, reviewers_json = ?, milestone = ?,
 			review_decision = ?, ci_status = ?, mergeable = ?, comments_count = ?,
 			created_at = ?, updated_at = ?, closed_at = ?, merged_at = ?,
-			last_seen_at = ?, synced_at = ?
+			last_seen_at = ?, synced_at = ?, metadata = ?
 		 WHERE id = ?`,
 		item.Title, item.URL, item.State, draft, item.Author, item.Body,
 		string(labelsJSON), string(assigneesJSON), string(reviewersJSON), item.Milestone,
 		item.ReviewDecision, item.CIStatus, item.Mergeable, item.Comments,
-		createdAt, updatedAt, closedAt, mergedAt, dbTime(now), dbTime(now), existingID,
+		createdAt, updatedAt, closedAt, mergedAt, dbTime(now), dbTime(now), string(metadata), existingID,
 	)
 	if err != nil {
 		return fmt.Errorf("更新条目失败 %s#%d: %w", repo, item.Number, err)
@@ -208,12 +273,60 @@ func upsertItem(ctx context.Context, tx *sql.Tx, repo string, item GitHubItem, n
 	return nil
 }
 
+const itemColumns = `id, source, repo, number, kind, title, url, state, is_draft, author, body,
+	labels_json, assignees_json, reviewers_json, milestone, review_decision,
+	ci_status, mergeable, comments_count, created_at, updated_at, closed_at,
+	merged_at, first_seen_at, last_seen_at, metadata`
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanItem(row rowScanner) (Item, error) {
+	var item Item
+	var draft int
+	var labelsJSON, assigneesJSON, reviewersJSON, metadata string
+	var createdAt, updatedAt, closedAt, mergedAt sql.NullString
+	if err := row.Scan(
+		&item.ID, &item.Source, &item.Repo, &item.Number, &item.Kind, &item.Title,
+		&item.URL, &item.State, &draft, &item.Author, &item.Body, &labelsJSON,
+		&assigneesJSON, &reviewersJSON, &item.Milestone, &item.ReviewDecision,
+		&item.CIStatus, &item.Mergeable, &item.Comments, &createdAt, &updatedAt,
+		&closedAt, &mergedAt, &item.FirstSeenAt, &item.LastSeenAt, &metadata,
+	); err != nil {
+		return Item{}, err
+	}
+	item.IsDraft = draft == 1
+	item.CreatedAt = parseNullableTime(createdAt)
+	item.UpdatedAt = parseNullableTime(updatedAt)
+	item.ClosedAt = parseNullableTime(closedAt)
+	item.MergedAt = parseNullableTime(mergedAt)
+	_ = json.Unmarshal([]byte(labelsJSON), &item.Labels)
+	_ = json.Unmarshal([]byte(assigneesJSON), &item.Assignees)
+	_ = json.Unmarshal([]byte(reviewersJSON), &item.Reviewers)
+	if item.Kind == "pr" && metadata != "" && metadata != "{}" {
+		var pr PRMeta
+		if json.Unmarshal([]byte(metadata), &pr) == nil && pr.HeadRef != "" {
+			item.PR = &pr
+		}
+	}
+	item.Tags = []Tag{}
+	item.Fields = map[string]any{}
+	return item, nil
+}
+
+// GetItem 读取单个条目（不含标签和字段值）。
+func (s *Store) GetItem(ctx context.Context, id int64) (Item, error) {
+	item, err := scanItem(s.db.QueryRowContext(ctx, `SELECT `+itemColumns+` FROM items WHERE id = ?`, id))
+	if err != nil {
+		return Item{}, normalizeNotFound(err)
+	}
+	return item, nil
+}
+
 func (s *Store) ListItems(ctx context.Context) ([]Item, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, source, repo, number, kind, title, url, state, is_draft, author, body,
-			labels_json, assignees_json, reviewers_json, milestone, review_decision,
-			ci_status, mergeable, comments_count, created_at, updated_at, closed_at,
-			merged_at, first_seen_at, last_seen_at
+		`SELECT `+itemColumns+`
 		 FROM items ORDER BY COALESCE(updated_at, '') DESC, repo, number DESC`,
 	)
 	if err != nil {
@@ -224,29 +337,10 @@ func (s *Store) ListItems(ctx context.Context) ([]Item, error) {
 	items := make([]Item, 0)
 	ids := make([]int64, 0)
 	for rows.Next() {
-		var item Item
-		var draft int
-		var labelsJSON, assigneesJSON, reviewersJSON string
-		var createdAt, updatedAt, closedAt, mergedAt sql.NullString
-		if err := rows.Scan(
-			&item.ID, &item.Source, &item.Repo, &item.Number, &item.Kind, &item.Title,
-			&item.URL, &item.State, &draft, &item.Author, &item.Body, &labelsJSON,
-			&assigneesJSON, &reviewersJSON, &item.Milestone, &item.ReviewDecision,
-			&item.CIStatus, &item.Mergeable, &item.Comments, &createdAt, &updatedAt,
-			&closedAt, &mergedAt, &item.FirstSeenAt, &item.LastSeenAt,
-		); err != nil {
+		item, err := scanItem(rows)
+		if err != nil {
 			return nil, err
 		}
-		item.IsDraft = draft == 1
-		item.CreatedAt = parseNullableTime(createdAt)
-		item.UpdatedAt = parseNullableTime(updatedAt)
-		item.ClosedAt = parseNullableTime(closedAt)
-		item.MergedAt = parseNullableTime(mergedAt)
-		_ = json.Unmarshal([]byte(labelsJSON), &item.Labels)
-		_ = json.Unmarshal([]byte(assigneesJSON), &item.Assignees)
-		_ = json.Unmarshal([]byte(reviewersJSON), &item.Reviewers)
-		item.Tags = []Tag{}
-		item.Fields = map[string]any{}
 		items = append(items, item)
 		ids = append(ids, item.ID)
 	}
@@ -667,25 +761,58 @@ func (s *Store) LatestSyncRun(ctx context.Context) (*SyncRun, error) {
 	return &run, nil
 }
 
-func (s *Store) SetRepoResult(ctx context.Context, fullName, errorText string) error {
-	now := dbTime(time.Now())
-	lastSynced := now
-	if errorText != "" {
-		lastSynced = ""
+func (s *Store) SaveRepoResult(ctx context.Context, result RepoResult) error {
+	lastSynced := ""
+	if result.Synced {
+		lastSynced = dbTime(time.Now())
+	}
+	updateHead := 0
+	if result.UpdateHead {
+		updateHead = 1
+	}
+	synced := 0
+	if result.Synced {
+		synced = 1
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO repos (full_name, last_synced_at, last_error) VALUES (?, ?, ?)
-		 ON CONFLICT(full_name) DO UPDATE SET
-			last_synced_at = CASE WHEN excluded.last_error = '' THEN excluded.last_synced_at ELSE repos.last_synced_at END,
-			last_error = excluded.last_error`,
-		fullName, lastSynced, errorText,
+		`INSERT INTO repos (
+			full_name, tracked_branch, last_synced_at, last_error,
+			commit_sha, commit_message, commit_committed_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(full_name) DO UPDATE SET
+			tracked_branch = CASE WHEN ? THEN excluded.tracked_branch ELSE repos.tracked_branch END,
+			last_synced_at = CASE WHEN ? THEN excluded.last_synced_at ELSE repos.last_synced_at END,
+			last_error = excluded.last_error,
+			commit_sha = CASE WHEN ? THEN excluded.commit_sha ELSE repos.commit_sha END,
+			commit_message = CASE WHEN ? THEN excluded.commit_message ELSE repos.commit_message END,
+			commit_committed_at = CASE WHEN ? THEN excluded.commit_committed_at ELSE repos.commit_committed_at END`,
+		result.FullName, result.TrackedBranch, lastSynced, result.LastError,
+		result.CommitSHA, result.CommitMessage, result.CommitCommittedAt,
+		updateHead, synced, updateHead, updateHead, updateHead,
 	)
 	return err
 }
 
+func (s *Store) DeleteRepoData(ctx context.Context, fullName string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM items WHERE repo = ?`, fullName); err != nil {
+		return fmt.Errorf("删除仓库记录失败: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM repos WHERE full_name = ?`, fullName); err != nil {
+		return fmt.Errorf("删除仓库状态失败: %w", err)
+	}
+	return tx.Commit()
+}
+
 func (s *Store) ListRepoStatuses(ctx context.Context) ([]RepoStatus, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT full_name, last_synced_at, last_error FROM repos ORDER BY full_name COLLATE NOCASE`,
+		`SELECT full_name, tracked_branch, last_synced_at, last_error,
+			commit_sha, commit_message, commit_committed_at
+		 FROM repos ORDER BY full_name COLLATE NOCASE`,
 	)
 	if err != nil {
 		return nil, err
@@ -694,7 +821,10 @@ func (s *Store) ListRepoStatuses(ctx context.Context) ([]RepoStatus, error) {
 	repos := make([]RepoStatus, 0)
 	for rows.Next() {
 		var repo RepoStatus
-		if err := rows.Scan(&repo.FullName, &repo.LastSynced, &repo.LastError); err != nil {
+		if err := rows.Scan(
+			&repo.FullName, &repo.TrackedBranch, &repo.LastSynced, &repo.LastError,
+			&repo.CommitSHA, &repo.CommitMessage, &repo.CommitCommittedAt,
+		); err != nil {
 			return nil, err
 		}
 		repos = append(repos, repo)

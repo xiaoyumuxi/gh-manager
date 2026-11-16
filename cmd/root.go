@@ -18,17 +18,19 @@ var (
 	date    = "unknown"
 
 	homeOverride string
+	rootServe    = &serveOptions{}
 )
 
 var rootCmd = &cobra.Command{
 	Use:           "gh-manager",
 	Short:         "跨仓库管理 GitHub Issue 与 Pull Request",
-	Long:          "GH Manager 使用 GitHub CLI 的登录状态同步多个仓库的 Issue 和 Pull Request，并在本地网页中管理标签与自定义字段。",
+	Long:          "GH Manager 使用 GitHub CLI 的登录状态同步多个仓库的 Issue 和 Pull Request，并在本地网页中管理标签、字段以及调用 Claude Code / Codex 进行处理。直接运行即启动网页。",
 	SilenceErrors: true,
 	SilenceUsage:  true,
 	Version:       version,
+	Args:          cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return cmd.Help()
+		return runServe(cmd, rootServe)
 	},
 }
 
@@ -46,6 +48,7 @@ func Execute() {
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&homeOverride, "home", "", "配置与数据库目录（也可使用 GH_MANAGER_HOME）")
+	bindServeFlags(rootCmd, rootServe)
 	rootCmd.AddCommand(newInitCommand())
 	rootCmd.AddCommand(newSyncCommand())
 	rootCmd.AddCommand(newServeCommand())

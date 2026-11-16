@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xiaoyumuxi/gh-manager/internal/agent"
 	"github.com/xiaoyumuxi/gh-manager/internal/config"
 	"github.com/xiaoyumuxi/gh-manager/internal/githubsync"
 	"github.com/xiaoyumuxi/gh-manager/internal/store"
@@ -34,8 +35,15 @@ type Server struct {
 	version        string
 	sessionToken   string
 	allowedOrigins map[string]struct{}
+	allowedHosts   map[string]struct{}
+	configMu       sync.RWMutex
 	syncMu         sync.Mutex
 	syncState      SyncStatus
+	agents         *agent.Manager
+	streamsDone    chan struct{}
+	stopOnce       sync.Once
+	detailMu       sync.Mutex
+	detailCache    map[int64]cachedDetail
 }
 
 type SyncStatus struct {
@@ -57,15 +65,19 @@ type Stats struct {
 }
 
 type StateResponse struct {
-	Items        []store.Item       `json:"items"`
-	Tags         []store.Tag        `json:"tags"`
-	Fields       []store.FieldDef   `json:"fields"`
-	Stats        Stats              `json:"stats"`
-	LastSync     *store.SyncRun     `json:"last_sync"`
-	RepoStatuses []store.RepoStatus `json:"repo_statuses"`
-	Syncing      bool               `json:"syncing"`
-	SyncStatus   SyncStatus         `json:"sync_status"`
-	Workspace    Workspace          `json:"workspace"`
+	Repositories []config.RepoConfig       `json:"repositories"`
+	Items        []store.Item              `json:"items"`
+	Tags         []store.Tag               `json:"tags"`
+	Fields       []store.FieldDef          `json:"fields"`
+	Stats        Stats                     `json:"stats"`
+	LastSync     *store.SyncRun            `json:"last_sync"`
+	RepoStatuses []store.RepoStatus        `json:"repo_statuses"`
+	Syncing      bool                      `json:"syncing"`
+	SyncStatus   SyncStatus                `json:"sync_status"`
+	Workspace    Workspace                 `json:"workspace"`
+	Actions      []store.Action            `json:"actions"`
+	LatestRuns   map[string]store.AgentRun `json:"latest_runs"`
+	ActiveRuns   int                       `json:"active_runs"`
 }
 
 type Workspace struct {
@@ -77,21 +89,56 @@ type Workspace struct {
 	Version         string `json:"version"`
 }
 
-func New(options Options) *Server {
+func New(options Options) (*Server, error) {
 	token := randomToken()
 	port := options.Config.Server.Port
-	return &Server{
-		store:        options.Store,
-		config:       options.Config,
-		paths:        options.Paths,
-		version:      options.Version,
-		sessionToken: token,
-		allowedOrigins: map[string]struct{}{
-			fmt.Sprintf("http://127.0.0.1:%d", port): {},
-			fmt.Sprintf("http://localhost:%d", port): {},
-			fmt.Sprintf("http://[::1]:%d", port):     {},
-		},
-		syncState: SyncStatus{Message: "尚未同步"},
+	server := &Server{
+		store:          options.Store,
+		config:         options.Config,
+		paths:          options.Paths,
+		version:        options.Version,
+		sessionToken:   token,
+		allowedOrigins: map[string]struct{}{},
+		allowedHosts:   map[string]struct{}{},
+		syncState:      SyncStatus{Message: "尚未同步"},
+		streamsDone:    make(chan struct{}),
+		detailCache:    map[int64]cachedDetail{},
+	}
+	for _, host := range []string{"127.0.0.1", "localhost", "[::1]"} {
+		address := fmt.Sprintf("%s:%d", host, port)
+		server.allowedHosts[address] = struct{}{}
+		server.allowedOrigins["http://"+address] = struct{}{}
+	}
+	manager, err := agent.NewManager(options.Store, options.Paths.ResolveWorkspaceDir(options.Config), options.Paths.RunsDir, server.agentSettings)
+	if err != nil {
+		return nil, err
+	}
+	server.agents = manager
+	return server, nil
+}
+
+// StopStreams 结束所有长连接（SSE），让 HTTP 服务可以及时关闭。
+func (s *Server) StopStreams() {
+	s.stopOnce.Do(func() { close(s.streamsDone) })
+}
+
+// Close 取消运行中的 Agent 任务。
+func (s *Server) Close() {
+	s.StopStreams()
+	s.agents.Close()
+}
+
+func (s *Server) agentSettings() agent.Settings {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	cfg := s.config.Agent
+	return agent.Settings{
+		ClaudeCommand: cfg.ClaudeCommand,
+		CodexCommand:  cfg.CodexCommand,
+		ClaudeModel:   cfg.ClaudeModel,
+		CodexModel:    cfg.CodexModel,
+		MaxConcurrent: cfg.MaxConcurrent,
+		Timeout:       time.Duration(cfg.TimeoutMinutes) * time.Minute,
 	}
 }
 
@@ -100,6 +147,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/state", s.handleState)
 	mux.HandleFunc("POST /api/sync", s.handleStartSync)
 	mux.HandleFunc("GET /api/sync/status", s.handleSyncStatus)
+	mux.HandleFunc("POST /api/repos", s.handleAddRepo)
+	mux.HandleFunc("PATCH /api/repos", s.handleUpdateRepo)
+	mux.HandleFunc("DELETE /api/repos", s.handleDeleteRepo)
 	mux.HandleFunc("POST /api/tags", s.handleCreateTag)
 	mux.HandleFunc("PATCH /api/tags/{id}", s.handleUpdateTag)
 	mux.HandleFunc("DELETE /api/tags/{id}", s.handleDeleteTag)
@@ -108,6 +158,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/fields/{id}", s.handleUpdateField)
 	mux.HandleFunc("DELETE /api/fields/{id}", s.handleDeleteField)
 	mux.HandleFunc("PUT /api/items/{id}/fields/{fieldID}", s.handleSetItemField)
+	s.registerAgentRoutes(mux)
 
 	staticFS, err := fs.Sub(web.Assets, "static")
 	if err != nil {
@@ -122,11 +173,19 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) Addr() string {
-	return fmt.Sprintf("127.0.0.1:%d", s.config.Server.Port)
+	s.configMu.RLock()
+	port := s.config.Server.Port
+	s.configMu.RUnlock()
+	return fmt.Sprintf("127.0.0.1:%d", port)
 }
 
 func (s *Server) browserGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 只接受本机地址作为 Host，防止 DNS 重绑定攻击借用浏览器访问本服务。
+		if _, ok := s.allowedHosts[strings.ToLower(r.Host)]; !ok {
+			http.Error(w, "forbidden host", http.StatusForbidden)
+			return
+		}
 		cookie, err := r.Cookie("gh_manager_session")
 		validCookie := err == nil && cookie.Value == s.sessionToken
 		if !validCookie {
@@ -138,6 +197,10 @@ func (s *Server) browserGuard(next http.Handler) http.Handler {
 				HttpOnly: true,
 				SameSite: http.SameSiteStrictMode,
 			})
+		}
+		if !isUnsafeMethod(r.Method) && strings.HasPrefix(r.URL.Path, "/api/") && !validCookie {
+			writeError(w, http.StatusForbidden, "会话已失效，请刷新页面")
+			return
 		}
 		if isUnsafeMethod(r.Method) && strings.HasPrefix(r.URL.Path, "/api/") {
 			if !validCookie {
@@ -156,11 +219,25 @@ func (s *Server) browserGuard(next http.Handler) http.Handler {
 		}
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Content-Security-Policy", contentSecurityPolicy)
 		next.ServeHTTP(w, r)
 	})
 }
 
+const contentSecurityPolicy = "default-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; " +
+	"script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'"
+
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
+	s.configMu.RLock()
+	repos := append([]config.RepoConfig(nil), s.config.Repos...)
+	staleDays := s.config.Sync.StaleDays
+	reviewStaleDays := s.config.Sync.ReviewStaleDays
+	s.syncMu.Lock()
+	syncState := s.syncState
+	s.syncMu.Unlock()
+	s.configMu.RUnlock()
+
 	items, err := s.store.ListItems(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -186,6 +263,23 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	items = filterConfiguredItems(items, repos)
+	repoStatuses = mergeRepoStatuses(repos, repoStatuses)
+	actions, err := s.store.ListActions(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	latest, err := s.store.LatestRunsByItem(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	latestRuns := make(map[string]store.AgentRun, len(latest))
+	for itemID, run := range latest {
+		latestRuns[strconv.FormatInt(itemID, 10)] = run
+	}
+	activeRuns, _ := s.store.CountActiveRuns(r.Context())
 
 	now := time.Now().UTC()
 	stats := Stats{Total: len(items)}
@@ -210,10 +304,10 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 			if item.StaleDays < 0 {
 				item.StaleDays = 0
 			}
-			item.Stale = item.StaleDays >= s.config.Sync.StaleDays
+			item.Stale = item.StaleDays >= staleDays
 			item.ReviewStale = item.Kind == "pr" &&
 				(item.ReviewDecision == "REVIEW_REQUIRED" || len(item.Reviewers) > 0) &&
-				item.StaleDays >= s.config.Sync.ReviewStaleDays
+				item.StaleDays >= reviewStaleDays
 			if item.Stale {
 				stats.Stale++
 			}
@@ -223,10 +317,8 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.syncMu.Lock()
-	syncState := s.syncState
-	s.syncMu.Unlock()
 	writeJSON(w, http.StatusOK, StateResponse{
+		Repositories: repos,
 		Items:        items,
 		Tags:         tags,
 		Fields:       fields,
@@ -238,18 +330,26 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		Workspace: Workspace{
 			ConfigPath:      s.paths.ConfigFile,
 			DBPath:          s.paths.DBFile,
-			RepoCount:       len(s.config.Repos),
-			StaleDays:       s.config.Sync.StaleDays,
-			ReviewStaleDays: s.config.Sync.ReviewStaleDays,
+			RepoCount:       len(repos),
+			StaleDays:       staleDays,
+			ReviewStaleDays: reviewStaleDays,
 			Version:         s.version,
 		},
+		Actions:    actions,
+		LatestRuns: latestRuns,
+		ActiveRuns: activeRuns,
 	})
 }
 
 func (s *Server) handleStartSync(w http.ResponseWriter, r *http.Request) {
+	s.configMu.RLock()
+	repos := append([]config.RepoConfig(nil), s.config.Repos...)
+	pageSize := s.config.Sync.RequestPageSize
+	closedWindowDays := s.config.Sync.ClosedWindowDays
 	s.syncMu.Lock()
 	if s.syncState.Running {
 		s.syncMu.Unlock()
+		s.configMu.RUnlock()
 		writeError(w, http.StatusConflict, "同步正在进行中")
 		return
 	}
@@ -259,15 +359,16 @@ func (s *Server) handleStartSync(w http.ResponseWriter, r *http.Request) {
 		StartedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 	s.syncMu.Unlock()
+	s.configMu.RUnlock()
 
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 		defer cancel()
 		_, err := githubsync.Run(ctx, githubsync.SyncOptions{
 			Store:            s.store,
-			Repos:            s.config.Repos,
-			PageSize:         s.config.Sync.RequestPageSize,
-			ClosedWindowDays: s.config.Sync.ClosedWindowDays,
+			Repos:            repos,
+			PageSize:         pageSize,
+			ClosedWindowDays: closedWindowDays,
 			Progress: func(message string) {
 				s.syncMu.Lock()
 				s.syncState.Message = message
@@ -287,6 +388,218 @@ func (s *Server) handleStartSync(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	writeJSON(w, http.StatusAccepted, map[string]any{"started": true})
+}
+
+func (s *Server) handleAddRepo(w http.ResponseWriter, r *http.Request) {
+	s.handleSaveRepo(w, r, false)
+}
+
+func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
+	s.handleSaveRepo(w, r, true)
+}
+
+func (s *Server) handleSaveRepo(w http.ResponseWriter, r *http.Request, update bool) {
+	var payload struct {
+		Repo   string `json:"repo"`
+		Branch string `json:"branch"`
+	}
+	if !decodeJSON(w, r, &payload) {
+		return
+	}
+
+	repoName := config.NormalizeRepoName(payload.Repo)
+	branch := config.NormalizeBranchName(payload.Branch)
+	if _, _, err := config.SplitRepo(repoName); err != nil {
+		writeError(w, http.StatusBadRequest, "请输入 owner/repo 格式的仓库名")
+		return
+	}
+	if err := config.ValidateBranchName(branch); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	s.configMu.RLock()
+	existingIndex := findRepoIndex(s.config.Repos, repoName)
+	s.configMu.RUnlock()
+	if update && existingIndex < 0 {
+		writeError(w, http.StatusNotFound, "仓库不在管理列表中")
+		return
+	}
+	if !update && existingIndex >= 0 {
+		writeError(w, http.StatusConflict, "该仓库已在管理列表中")
+		return
+	}
+	if s.syncIsRunning() {
+		writeError(w, http.StatusConflict, "同步进行中，暂时不能修改仓库")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	head, err := githubsync.GetRepositoryHead(ctx, repoName, branch)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			writeError(w, http.StatusGatewayTimeout, "验证仓库超时，请稍后重试")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "无法验证仓库或分支："+err.Error())
+		return
+	}
+
+	s.configMu.Lock()
+	s.syncMu.Lock()
+	if s.syncState.Running {
+		s.syncMu.Unlock()
+		s.configMu.Unlock()
+		writeError(w, http.StatusConflict, "同步进行中，暂时不能修改仓库")
+		return
+	}
+
+	existingIndex = findRepoIndex(s.config.Repos, repoName)
+	if update && existingIndex < 0 {
+		s.syncMu.Unlock()
+		s.configMu.Unlock()
+		writeError(w, http.StatusNotFound, "仓库不在管理列表中")
+		return
+	}
+	if !update && existingIndex >= 0 {
+		s.syncMu.Unlock()
+		s.configMu.Unlock()
+		writeError(w, http.StatusConflict, "该仓库已在管理列表中")
+		return
+	}
+
+	next := cloneConfig(s.config)
+	repoConfig := config.RepoConfig{Name: repoName, Branch: branch}
+	if update {
+		next.Repos[existingIndex] = repoConfig
+	} else {
+		next.Repos = append(next.Repos, repoConfig)
+	}
+	if err := config.Save(s.paths.ConfigFile, next); err != nil {
+		s.syncMu.Unlock()
+		s.configMu.Unlock()
+		writeError(w, http.StatusInternalServerError, "保存仓库配置失败："+err.Error())
+		return
+	}
+	s.config = next
+	s.syncMu.Unlock()
+	s.configMu.Unlock()
+
+	status := store.RepoResult{
+		FullName:          repoName,
+		TrackedBranch:     head.Branch,
+		CommitSHA:         head.SHA,
+		CommitMessage:     head.Message,
+		CommitCommittedAt: head.CommittedAt.UTC().Format(time.RFC3339),
+		UpdateHead:        true,
+	}
+	if err := s.store.SaveRepoResult(r.Context(), status); err != nil {
+		writeError(w, http.StatusInternalServerError, "仓库已保存，但写入仓库状态失败："+err.Error())
+		return
+	}
+
+	code := http.StatusCreated
+	if update {
+		code = http.StatusOK
+	}
+	writeJSON(w, code, repoConfig)
+}
+
+func (s *Server) handleDeleteRepo(w http.ResponseWriter, r *http.Request) {
+	repoName := config.NormalizeRepoName(r.URL.Query().Get("repo"))
+	if _, _, err := config.SplitRepo(repoName); err != nil {
+		writeError(w, http.StatusBadRequest, "缺少有效的仓库名")
+		return
+	}
+
+	s.configMu.Lock()
+	s.syncMu.Lock()
+	if s.syncState.Running {
+		s.syncMu.Unlock()
+		s.configMu.Unlock()
+		writeError(w, http.StatusConflict, "同步进行中，暂时不能修改仓库")
+		return
+	}
+	index := findRepoIndex(s.config.Repos, repoName)
+	if index < 0 {
+		s.syncMu.Unlock()
+		s.configMu.Unlock()
+		writeError(w, http.StatusNotFound, "仓库不在管理列表中")
+		return
+	}
+	next := cloneConfig(s.config)
+	next.Repos = append(next.Repos[:index], next.Repos[index+1:]...)
+	if err := config.Save(s.paths.ConfigFile, next); err != nil {
+		s.syncMu.Unlock()
+		s.configMu.Unlock()
+		writeError(w, http.StatusInternalServerError, "保存仓库配置失败："+err.Error())
+		return
+	}
+	s.config = next
+	s.syncMu.Unlock()
+	s.configMu.Unlock()
+
+	if err := s.store.DeleteRepoData(r.Context(), repoName); err != nil {
+		writeError(w, http.StatusInternalServerError, "仓库已从配置移除，但清理本地数据失败："+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) syncIsRunning() bool {
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+	return s.syncState.Running
+}
+
+func cloneConfig(source *config.Config) *config.Config {
+	next := *source
+	next.Repos = append([]config.RepoConfig(nil), source.Repos...)
+	return &next
+}
+
+func findRepoIndex(repos []config.RepoConfig, fullName string) int {
+	for index, repo := range repos {
+		if strings.EqualFold(repo.Name, fullName) {
+			return index
+		}
+	}
+	return -1
+}
+
+func filterConfiguredItems(items []store.Item, repos []config.RepoConfig) []store.Item {
+	configured := make(map[string]struct{}, len(repos))
+	for _, repo := range repos {
+		configured[strings.ToLower(repo.Name)] = struct{}{}
+	}
+	filtered := make([]store.Item, 0, len(items))
+	for _, item := range items {
+		if item.Source != "github" {
+			filtered = append(filtered, item)
+			continue
+		}
+		if _, ok := configured[strings.ToLower(item.Repo)]; ok {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
+}
+
+func mergeRepoStatuses(repos []config.RepoConfig, statuses []store.RepoStatus) []store.RepoStatus {
+	byName := make(map[string]store.RepoStatus, len(statuses))
+	for _, status := range statuses {
+		byName[strings.ToLower(status.FullName)] = status
+	}
+	merged := make([]store.RepoStatus, 0, len(repos))
+	for _, repo := range repos {
+		status, ok := byName[strings.ToLower(repo.Name)]
+		if !ok {
+			status = store.RepoStatus{FullName: repo.Name}
+		}
+		merged = append(merged, status)
+	}
+	return merged
 }
 
 func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
