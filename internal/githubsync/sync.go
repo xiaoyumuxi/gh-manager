@@ -34,7 +34,7 @@ func Run(ctx context.Context, options SyncOptions) (Summary, error) {
 		return Summary{}, errors.New("数据库未初始化")
 	}
 	if len(options.Repos) == 0 {
-		return Summary{}, errors.New("配置中没有仓库，请编辑 config.yml 或运行 gh-manager init --org <owner>")
+		return Summary{}, errors.New("还没有添加仓库，请先在「仓库」中添加或从组织导入")
 	}
 	if options.PageSize <= 0 || options.PageSize > 100 {
 		options.PageSize = 100

@@ -7,7 +7,9 @@
   <title>GH Manager · GitHub 工作台</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%233370ff'/%3E%3Cpath d='M8 20.5h4v4H8zM14 14h4v10.5h-4zM20 8h4v16.5h-4z' fill='white'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/app.css">
+  <link rel="stylesheet" href="/workbench.css">
   <script src="/app.js" defer></script>
+  <script src="/workbench.js" defer></script>
 </head>
 <body>
   <header class="app-header">
@@ -25,6 +27,14 @@
       <span>管理仓库</span>
     </button>
     <div class="header-actions">
+      <button class="agent-indicator" id="agentIndicator" type="button" title="本机 AI CLI 与运行中的任务">
+        <span class="agent-dot" id="claudeDot" aria-hidden="true"></span><span>Claude</span>
+        <span class="agent-dot" id="codexDot" aria-hidden="true"></span><span>Codex</span>
+        <span class="agent-active" id="agentActive" hidden>0</span>
+      </button>
+      <button class="icon-button" id="openSettings" type="button" title="设置" aria-label="设置">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 12.6a2.6 2.6 0 1 0 0-5.2 2.6 2.6 0 0 0 0 5.2Z" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M16.2 11.4a6.4 6.4 0 0 0 0-2.8l1.5-1.2-1.6-2.7-1.8.7a6.4 6.4 0 0 0-2.4-1.4L11.6 2H8.4l-.3 2a6.4 6.4 0 0 0-2.4 1.4l-1.8-.7-1.6 2.7 1.5 1.2a6.4 6.4 0 0 0 0 2.8l-1.5 1.2 1.6 2.7 1.8-.7a6.4 6.4 0 0 0 2.4 1.4l.3 2h3.2l.3-2a6.4 6.4 0 0 0 2.4-1.4l1.8.7 1.6-2.7-1.5-1.2Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
+      </button>
       <div class="sync-state" id="syncState" title="同步状态">
         <span class="sync-dot" id="syncDot" aria-hidden="true"></span>
         <span id="syncText">正在读取工作区...</span>
@@ -45,7 +55,7 @@
       </div>
       <div class="intro-note">
         <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.8 3.5 6v4.2c0 3.7 2.7 6.2 6.5 7 3.8-.8 6.5-3.3 6.5-7V6L10 2.8Z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m7.4 10 1.7 1.7 3.6-3.8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        <span>GitHub 数据只读同步；标签和自定义字段仅保存在本机。</span>
+        <span>评论与代码改动只会在你确认后写回 GitHub；标签和自定义字段仅保存在本机。</span>
       </div>
     </section>
 
@@ -59,6 +69,15 @@
     </section>
 
     <section class="board">
+      <nav class="view-tabs" id="viewTabs" aria-label="快捷视图">
+        <button type="button" class="view-tab" data-view="">全部<span class="view-count" data-count=""></span></button>
+        <button type="button" class="view-tab" data-view="review">待我审查<span class="view-count" data-count="review"></span></button>
+        <button type="button" class="view-tab" data-view="mine">我创建的<span class="view-count" data-count="mine"></span></button>
+        <button type="button" class="view-tab" data-view="assigned">指派给我<span class="view-count" data-count="assigned"></span></button>
+        <button type="button" class="view-tab" data-view="ai">AI 处理过<span class="view-count" data-count="ai"></span></button>
+        <span class="toolbar-spacer"></span>
+        <span class="view-viewer" id="viewerLabel"></span>
+      </nav>
       <div class="toolbar">
         <label class="search-box">
           <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.8" cy="8.8" r="5.3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m13 13 4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
@@ -99,6 +118,10 @@
         </label>
         <button class="button button-quiet filter-reset" id="resetFilters" type="button" hidden>清除筛选</button>
         <span class="toolbar-spacer"></span>
+        <button class="button button-quiet" id="manageActions" type="button">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.8 11.6 7l4.4.4-3.4 2.9 1 4.3L10 12.3l-3.6 2.3 1-4.3L4 7.4 8.4 7 10 2.8Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+          AI 操作
+        </button>
         <button class="button button-quiet" id="manageTags" type="button">
           <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5.5h8.2l5.3 5.2-6 6-5.3-5.3V5.5Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><circle cx="7" cy="8.5" r="1.2" fill="currentColor"/></svg>
           标签
@@ -128,6 +151,22 @@
       </footer>
     </section>
   </main>
+
+  <div class="batch-bar" id="batchBar" hidden>
+    <span class="batch-count" id="batchCount">已选 0 项</span>
+    <button class="button button-primary button-small" id="batchRun" type="button">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6.5 4.5v11l9-5.5-9-5.5Z" fill="currentColor"/></svg>
+      运行 AI 操作
+    </button>
+    <button class="button button-quiet button-small" id="batchClear" type="button">取消选择</button>
+  </div>
+
+  <aside class="drawer" id="drawer" hidden aria-label="详情">
+    <div class="drawer-resize" aria-hidden="true"></div>
+    <header class="drawer-header" id="drawerHeader"></header>
+    <nav class="drawer-tabs" id="drawerTabs"></nav>
+    <div class="drawer-body" id="drawerBody"></div>
+  </aside>
 
   <div class="popover" id="popover" hidden></div>
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
@@ -229,9 +268,301 @@
         <p class="form-hint repo-create-hint">添加时会通过 GitHub CLI 验证仓库与分支；留空时自动跟随默认分支。</p>
       </form>
 
+      <details class="org-import" id="orgImport">
+        <summary>从组织或用户批量导入</summary>
+        <form class="compact-form" id="orgImportForm">
+          <label class="field-inline grow">
+            <span>组织 / 用户</span>
+            <input id="orgImportOwner" type="text" placeholder="例如：xiaoyumuxi" autocomplete="off" required>
+          </label>
+          <button class="button button-quiet" type="submit">读取仓库</button>
+        </form>
+        <div class="org-import-list" id="orgImportList"></div>
+      </details>
+
       <div class="dialog-section-title">追踪中的仓库</div>
       <div class="dialog-list repo-manage-list" id="repoManageList"></div>
     </div>
+  </dialog>
+
+  <dialog class="dialog" id="runDialog">
+    <form class="dialog-card" id="runForm" method="dialog">
+      <header class="dialog-header">
+        <div>
+          <p class="eyebrow">RUN AGENT</p>
+          <h2>运行 AI 操作</h2>
+        </div>
+        <button class="icon-button dialog-close" type="button" data-close-dialog="runDialog" aria-label="关闭">
+          <svg viewBox="0 0 20 20"><path d="m5 5 10 10M15 5 5 15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        </button>
+      </header>
+      <div class="run-targets" id="runTargets"></div>
+      <div class="form-grid">
+        <label class="stack-field">
+          <span>操作</span>
+          <select id="runAction" required></select>
+        </label>
+        <label class="stack-field">
+          <span>SKILL（可选，覆盖操作默认值）</span>
+          <input id="runSkill" type="text" list="runSkillList" autocomplete="off" placeholder="留空则不指定">
+          <datalist id="runSkillList"></datalist>
+        </label>
+      </div>
+      <p class="form-hint" id="runActionHint"></p>
+      <div class="skill-hint" id="runSkillHint"></div>
+      <label class="stack-field">
+        <span>本次补充要求（可选）</span>
+        <textarea id="runExtra" rows="3" placeholder="例如：重点关注并发安全；只看 internal/server 目录"></textarea>
+      </label>
+      <div class="form-actions">
+        <span class="form-hint">Agent 在独立的 git worktree 中运行；结果发布或推送前都会再次请你确认。</span>
+        <button class="button button-primary" id="runSubmit" type="submit">开始运行</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="dialog dialog-wide" id="publishDialog">
+    <form class="dialog-card" id="publishForm" method="dialog">
+      <header class="dialog-header">
+        <div>
+          <p class="eyebrow">CONFIRM · WRITE TO GITHUB</p>
+          <h2>确认发布到 GitHub</h2>
+        </div>
+        <button class="icon-button dialog-close" type="button" data-close-dialog="publishDialog" aria-label="关闭">
+          <svg viewBox="0 0 20 20"><path d="m5 5 10 10M15 5 5 15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        </button>
+      </header>
+      <div class="confirm-target" id="publishTarget"></div>
+      <div class="segmented" id="publishModes"></div>
+      <div class="editor-tabs">
+        <button type="button" class="editor-tab is-active" data-publish-tab="edit">编辑</button>
+        <button type="button" class="editor-tab" data-publish-tab="preview">预览</button>
+        <span class="toolbar-spacer"></span>
+        <span class="form-hint" id="publishLength"></span>
+      </div>
+      <textarea class="publish-body" id="publishBody" rows="16" spellcheck="false"></textarea>
+      <div class="markdown publish-preview" id="publishPreview" hidden></div>
+      <div class="form-actions">
+        <span class="form-hint">内容会以你的 GitHub 账号公开发布，发布后需要到 GitHub 上编辑或删除。</span>
+        <button class="button button-quiet" type="button" data-close-dialog="publishDialog">取消</button>
+        <button class="button button-primary" id="publishSubmit" type="submit">确认发布</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="dialog dialog-wide" id="applyDialog">
+    <form class="dialog-card" id="applyForm" method="dialog">
+      <header class="dialog-header">
+        <div>
+          <p class="eyebrow">CONFIRM · PUSH CHANGES</p>
+          <h2 id="applyTitle">确认推送改动</h2>
+        </div>
+        <button class="icon-button dialog-close" type="button" data-close-dialog="applyDialog" aria-label="关闭">
+          <svg viewBox="0 0 20 20"><path d="m5 5 10 10M15 5 5 15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        </button>
+      </header>
+      <div class="confirm-target" id="applyTarget"></div>
+      <div class="apply-warnings" id="applyWarnings"></div>
+      <label class="stack-field">
+        <span>提交说明</span>
+        <textarea id="applyCommit" rows="3" required></textarea>
+      </label>
+      <div id="applyPRFields" hidden>
+        <label class="stack-field">
+          <span>Pull Request 标题</span>
+          <input id="applyPRTitle" type="text" maxlength="300">
+        </label>
+        <label class="stack-field">
+          <span>Pull Request 描述</span>
+          <textarea id="applyPRBody" rows="6"></textarea>
+        </label>
+        <label class="toggle">
+          <input id="applyDraft" type="checkbox" checked>
+          <span>创建为草稿 PR</span>
+        </label>
+      </div>
+      <div class="dialog-section-title">即将提交的改动</div>
+      <div class="diff-view" id="applyDiff"></div>
+      <div class="form-actions">
+        <span class="form-hint" id="applyHint"></span>
+        <button class="button button-quiet" type="button" data-close-dialog="applyDialog">取消</button>
+        <button class="button button-primary" id="applySubmit" type="submit">确认提交并推送</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="dialog dialog-wide" id="diffDialog">
+    <div class="dialog-card">
+      <header class="dialog-header">
+        <div>
+          <p class="eyebrow">WORKTREE DIFF</p>
+          <h2 id="diffTitle">本地改动</h2>
+        </div>
+        <button class="icon-button dialog-close" type="button" data-close-dialog="diffDialog" aria-label="关闭">
+          <svg viewBox="0 0 20 20"><path d="m5 5 10 10M15 5 5 15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        </button>
+      </header>
+      <div class="diff-view" id="diffBody"></div>
+    </div>
+  </dialog>
+
+  <dialog class="dialog dialog-wide" id="actionsDialog">
+    <div class="dialog-card">
+      <header class="dialog-header">
+        <div>
+          <p class="eyebrow">AGENT ACTIONS</p>
+          <h2>AI 操作</h2>
+        </div>
+        <button class="icon-button dialog-close" type="button" data-close-dialog="actionsDialog" aria-label="关闭">
+          <svg viewBox="0 0 20 20"><path d="m5 5 10 10M15 5 5 15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        </button>
+      </header>
+      <div class="actions-layout">
+        <div class="actions-list" id="actionsList"></div>
+        <form class="action-form" id="actionForm">
+          <div class="dialog-section-title" id="actionFormTitle">新建操作</div>
+          <div class="form-grid">
+            <label class="stack-field">
+              <span>名称</span>
+              <input id="actionName" type="text" maxlength="80" required>
+            </label>
+            <label class="stack-field">
+              <span>Agent</span>
+              <select id="actionAgent">
+                <option value="claude">Claude Code</option>
+                <option value="codex">Codex</option>
+              </select>
+            </label>
+            <label class="stack-field">
+              <span>权限</span>
+              <select id="actionMode">
+                <option value="read">只读（审查、分析）</option>
+                <option value="edit">可修改代码</option>
+              </select>
+            </label>
+            <label class="stack-field">
+              <span>适用于</span>
+              <select id="actionAppliesTo">
+                <option value="all">PR 与 Issue</option>
+                <option value="pr">仅 Pull Request</option>
+                <option value="issue">仅 Issue</option>
+              </select>
+            </label>
+            <label class="stack-field">
+              <span>默认 SKILL（可选）</span>
+              <input id="actionSkill" type="text" list="actionSkillList" autocomplete="off" placeholder="例如：lithe-code-review">
+              <datalist id="actionSkillList"></datalist>
+            </label>
+            <label class="stack-field">
+              <span>模型（可选）</span>
+              <input id="actionModel" type="text" autocomplete="off" placeholder="留空使用设置中的默认模型">
+            </label>
+          </div>
+          <label class="stack-field">
+            <span>提示词</span>
+            <textarea id="actionPrompt" rows="9" spellcheck="false"></textarea>
+          </label>
+          <p class="form-hint">可用变量：{{repo}} {{number}} {{title}} {{url}} {{kind}} {{author}} {{base_ref}} {{head_ref}} {{diff_cmd}}。仓库的 AGENTS.md / CLAUDE.md 与 .agents/skills 等目录会从目标分支自动提供给 Agent。</p>
+          <details class="advanced">
+            <summary>高级：额外允许的 Claude 工具</summary>
+            <label class="stack-field">
+              <span>以逗号分隔，例如 Bash(go test:*),Bash(npm test:*)</span>
+              <input id="actionTools" type="text" autocomplete="off">
+            </label>
+          </details>
+          <div class="form-actions">
+            <button class="button button-danger" id="actionDelete" type="button" hidden>删除</button>
+            <span class="toolbar-spacer"></span>
+            <button class="button button-quiet" id="actionReset" type="button">新建</button>
+            <button class="button button-primary" type="submit" id="actionSave">保存</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog class="dialog dialog-wide" id="settingsDialog">
+    <form class="dialog-card" id="settingsForm" method="dialog">
+      <header class="dialog-header">
+        <div>
+          <p class="eyebrow">SETTINGS</p>
+          <h2>设置</h2>
+        </div>
+        <button class="icon-button dialog-close" type="button" data-close-dialog="settingsDialog" aria-label="关闭">
+          <svg viewBox="0 0 20 20"><path d="m5 5 10 10M15 5 5 15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        </button>
+      </header>
+      <div class="dialog-section-title">环境</div>
+      <div class="env-grid" id="envGrid"></div>
+      <div class="dialog-section-title">AI Agent</div>
+      <div class="form-grid">
+        <label class="stack-field">
+          <span>Claude 命令</span>
+          <input id="setClaudeCommand" type="text" placeholder="claude" autocomplete="off">
+        </label>
+        <label class="stack-field">
+          <span>Codex 命令</span>
+          <input id="setCodexCommand" type="text" placeholder="codex" autocomplete="off">
+        </label>
+        <label class="stack-field">
+          <span>Claude 默认模型</span>
+          <input id="setClaudeModel" type="text" placeholder="留空使用 CLI 默认" autocomplete="off">
+        </label>
+        <label class="stack-field">
+          <span>Codex 默认模型</span>
+          <input id="setCodexModel" type="text" placeholder="留空使用 CLI 默认" autocomplete="off">
+        </label>
+        <label class="stack-field">
+          <span>同时运行的任务数</span>
+          <input id="setMaxConcurrent" type="number" min="1" max="16">
+        </label>
+        <label class="stack-field">
+          <span>单个任务超时（分钟）</span>
+          <input id="setTimeout" type="number" min="1" max="720">
+        </label>
+      </div>
+      <label class="stack-field">
+        <span>代码工作区目录（修改后需重启 make run）</span>
+        <input id="setWorkspaceDir" type="text" autocomplete="off">
+      </label>
+      <div class="dialog-section-title">同步</div>
+      <div class="form-grid">
+        <label class="stack-field">
+          <span>超过多少天未更新视为停滞</span>
+          <input id="setStaleDays" type="number" min="1">
+        </label>
+        <label class="stack-field">
+          <span>评审超过多少天视为超时</span>
+          <input id="setReviewStaleDays" type="number" min="1">
+        </label>
+        <label class="stack-field">
+          <span>同步最近多少天关闭的记录</span>
+          <input id="setClosedWindowDays" type="number" min="1">
+        </label>
+        <label class="stack-field">
+          <span>每次请求条数</span>
+          <input id="setPageSize" type="number" min="1" max="100">
+        </label>
+      </div>
+      <div class="form-actions">
+        <span class="form-hint" id="settingsPath"></span>
+        <button class="button button-quiet" type="button" data-close-dialog="settingsDialog">取消</button>
+        <button class="button button-primary" type="submit" id="settingsSave">保存设置</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="dialog dialog-confirm" id="confirmDialog">
+    <form class="dialog-card" id="confirmForm" method="dialog">
+      <header class="dialog-header">
+        <h2 id="confirmTitle">确认</h2>
+      </header>
+      <p class="confirm-message" id="confirmMessage"></p>
+      <div class="form-actions">
+        <button class="button button-quiet" type="button" value="cancel" id="confirmCancel">取消</button>
+        <button class="button button-primary" type="submit" value="ok" id="confirmOK">确定</button>
+      </div>
+    </form>
   </dialog>
 </body>
 </html>

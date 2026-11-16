@@ -93,6 +93,16 @@ query($owner: String!, $name: String!, $first: Int!, $after: String) {
         }
         statusCheckRollup { state }
         mergeable
+        headRefName
+        headRefOid
+        baseRefName
+        baseRefOid
+        isCrossRepository
+        maintainerCanModify
+        headRepository { nameWithOwner }
+        additions
+        deletions
+        changedFiles
       }
     }
   }
@@ -131,6 +141,16 @@ query($owner: String!, $name: String!, $first: Int!, $after: String) {
         }
         statusCheckRollup { state }
         mergeable
+        headRefName
+        headRefOid
+        baseRefName
+        baseRefOid
+        isCrossRepository
+        maintainerCanModify
+        headRepository { nameWithOwner }
+        additions
+        deletions
+        changedFiles
       }
     }
   }
@@ -259,7 +279,19 @@ type pullRequestNode struct {
 	StatusCheckRollup *struct {
 		State string `json:"state"`
 	} `json:"statusCheckRollup"`
-	Mergeable string `json:"mergeable"`
+	Mergeable           string `json:"mergeable"`
+	HeadRefName         string `json:"headRefName"`
+	HeadRefOid          string `json:"headRefOid"`
+	BaseRefName         string `json:"baseRefName"`
+	BaseRefOid          string `json:"baseRefOid"`
+	IsCrossRepository   bool   `json:"isCrossRepository"`
+	MaintainerCanModify bool   `json:"maintainerCanModify"`
+	HeadRepository      *struct {
+		NameWithOwner string `json:"nameWithOwner"`
+	} `json:"headRepository"`
+	Additions    int `json:"additions"`
+	Deletions    int `json:"deletions"`
+	ChangedFiles int `json:"changedFiles"`
 }
 
 type issueConnection struct {
@@ -557,6 +589,22 @@ func mapPullRequest(owner, name string, node pullRequestNode) store.GitHubItem {
 	if node.StatusCheckRollup != nil {
 		ciStatus = node.StatusCheckRollup.State
 	}
+	headRepo := ""
+	if node.HeadRepository != nil {
+		headRepo = node.HeadRepository.NameWithOwner
+	}
+	pr := &store.PRMeta{
+		HeadRef:             node.HeadRefName,
+		HeadOID:             node.HeadRefOid,
+		HeadRepo:            headRepo,
+		BaseRef:             node.BaseRefName,
+		BaseOID:             node.BaseRefOid,
+		IsCrossRepository:   node.IsCrossRepository,
+		MaintainerCanModify: node.MaintainerCanModify,
+		Additions:           node.Additions,
+		Deletions:           node.Deletions,
+		ChangedFiles:        node.ChangedFiles,
+	}
 	return store.GitHubItem{
 		Repo:           owner + "/" + name,
 		Number:         node.Number,
@@ -579,6 +627,7 @@ func mapPullRequest(owner, name string, node pullRequestNode) store.GitHubItem {
 		UpdatedAt:      updatedAt,
 		ClosedAt:       closedAt,
 		MergedAt:       mergedAt,
+		PR:             pr,
 	}
 }
 

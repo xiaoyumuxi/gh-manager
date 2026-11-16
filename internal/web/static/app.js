@@ -4,10 +4,17 @@ const app = {
   tags: [],
   fields: [],
   repositories: [],
-  filters: { query: "", state: "", kind: "", tag: "", repos: [], stale: false },
+  filters: { query: "", state: "", kind: "", tag: "", repos: [], stale: false, view: "" },
   sort: { key: "updated_at", direction: "desc" },
   pollTimer: null,
   loadError: "",
+  // AI 工作台
+  actions: [],
+  latestRuns: {},
+  activeRuns: 0,
+  selected: new Set(),
+  viewer: null,
+  visibleIDs: [],
 };
 
 const dom = {};
@@ -284,13 +291,37 @@ function hasFilters() {
       app.filters.kind ||
       app.filters.tag ||
       app.filters.repos.length ||
-      app.filters.stale,
+      app.filters.stale ||
+      app.filters.view,
   );
+}
+
+function sameLogin(left, right) {
+  return Boolean(left && right && String(left).toLowerCase() === String(right).toLowerCase());
+}
+
+// 快捷视图：依赖当前 GitHub 账号（来自 /api/environment）。
+function matchesView(item, view) {
+  if (!view) return true;
+  const login = app.viewer?.login;
+  if (view === "ai") return Boolean(app.latestRuns[String(item.id)]);
+  if (!login) return false;
+  if (view === "review") {
+    return (
+      item.kind === "pr" &&
+      item.state === "open" &&
+      (Array.isArray(item.reviewers) ? item.reviewers : []).some((name) => sameLogin(name, login))
+    );
+  }
+  if (view === "mine") return sameLogin(item.author, login);
+  if (view === "assigned") return currentAssignees(item).some((name) => sameLogin(name, login));
+  return true;
 }
 
 function applyFilters() {
   const query = app.filters.query.trim().toLocaleLowerCase("zh-CN");
   return app.items.filter((item) => {
+    if (!matchesView(item, app.filters.view)) return false;
     if (app.filters.state) {
       const closed = app.filters.state === "closed";
       const matchesState =
@@ -358,6 +389,11 @@ function sortValue(item, key) {
     return date ? date.getTime() : null;
   }
   if (key === "stale_days") return item.stale_days ?? 0;
+  if (key === "ai") {
+    const run = app.latestRuns[String(item.id)];
+    const date = run ? parseDate(run.created_at) : null;
+    return date ? date.getTime() : null;
+  }
   if (key.startsWith("field:")) {
     const field = app.fields.find((candidate) => `field:${candidate.id}` === key);
     if (!field) return null;
@@ -394,6 +430,7 @@ function columns() {
     { key: "title", label: "事项", class: "col-title", sortable: true },
     { key: "kind", label: "类型", class: "col-kind", sortable: true },
     { key: "state", label: "状态", class: "col-state", sortable: true },
+    { key: "ai", label: "AI", class: "col-ai", sortable: true },
     { key: "tags", label: "本地标签", class: "col-tags", sortable: false },
     { key: "author", label: "作者", class: "col-author", sortable: true },
     { key: "labels", label: "GitHub 标签", class: "col-labels", sortable: false },
@@ -571,6 +608,9 @@ function renderTableHead() {
       { class: "th-inner" },
       h("span", { text: column.label, title: column.label }),
     );
+    if (column.key === "title") {
+      th.prepend(selectAllCheckbox());
+    }
     if (column.sortable) {
       th.dataset.sort = column.key;
       const active = app.sort.key === column.key;
@@ -589,6 +629,27 @@ function renderTableHead() {
     headRow.append(th);
   }
   dom.tableHead.replaceChildren(headRow);
+}
+
+function selectAllCheckbox() {
+  const visible = app.visibleIDs;
+  const selectedVisible = visible.filter((id) => app.selected.has(id)).length;
+  const checkbox = h("input", {
+    type: "checkbox",
+    class: "row-check",
+    title: "选择当前列表中的全部记录",
+    "aria-label": "全选",
+    dataset: { action: "select-all" },
+  });
+  checkbox.checked = visible.length > 0 && selectedVisible === visible.length;
+  checkbox.indeterminate = selectedVisible > 0 && selectedVisible < visible.length;
+  checkbox.addEventListener("click", (event) => event.stopPropagation());
+  checkbox.addEventListener("change", () => {
+    if (checkbox.checked) visible.forEach((id) => app.selected.add(id));
+    else visible.forEach((id) => app.selected.delete(id));
+    renderTable();
+  });
+  return checkbox;
 }
 
 function emptyRow(columnCount) {
@@ -678,22 +739,49 @@ function renderTableBody(items, columnCount) {
     return;
   }
   for (const item of items) {
-    const row = h("tr", { dataset: { itemId: item.id } });
+    const selected = app.selected.has(item.id);
+    const row = h("tr", {
+      class: [selected ? "is-selected" : "", app.openItemID === item.id ? "is-open" : ""]
+        .filter(Boolean)
+        .join(" "),
+      dataset: { itemId: item.id },
+    });
+    const check = h("input", {
+      type: "checkbox",
+      class: "row-check",
+      "aria-label": `选择 ${item.repo}#${item.number}`,
+      dataset: { action: "select-item", itemId: item.id },
+    });
+    check.checked = selected;
     row.append(
       h(
         "td",
         { class: "col-title" },
+        check,
         h(
           "div",
           { class: "item-main" },
-          h("a", {
+          h("button", {
             class: "item-link",
-            href: safeURL(item.url),
-            target: "_blank",
-            rel: "noopener noreferrer",
+            type: "button",
             text: item.title,
-            title: item.title,
+            title: `${item.title}\n点击查看详情与 AI 任务`,
+            dataset: { action: "open-item", itemId: item.id },
           }),
+          h(
+            "a",
+            {
+              class: "item-external",
+              href: safeURL(item.url),
+              target: "_blank",
+              rel: "noopener noreferrer",
+              title: "在 GitHub 中打开",
+              "aria-label": "在 GitHub 中打开",
+            },
+            icon(
+              '<path d="M8 4.5H5.5a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1V12M11 4.5h4.5V9M15.5 4.5 9 11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>',
+            ),
+          ),
         ),
         h(
           "div",
@@ -725,6 +813,10 @@ function renderTableBody(items, columnCount) {
     const statusCell = h("td", { class: "col-state" });
     statusCell.append(stateCell(item));
     row.append(statusCell);
+
+    const aiCell = h("td", { class: "col-ai" });
+    aiCell.append(typeof aiCellContent === "function" ? aiCellContent(item) : fallback("—"));
+    row.append(aiCell);
 
     const tagsCell = h("td", { class: "col-tags" });
     tagsCell.append(tagCellContent(item));
@@ -794,8 +886,9 @@ function renderTableBody(items, columnCount) {
 
 function renderTable() {
   const allColumns = columns();
-  renderTableHead();
   const filtered = sortedItems(applyFilters());
+  app.visibleIDs = filtered.map((item) => item.id);
+  renderTableHead();
   const scrollTop = dom.tableScroller.scrollTop;
   const scrollLeft = dom.tableScroller.scrollLeft;
   renderTableBody(filtered, allColumns.length);
@@ -806,6 +899,7 @@ function renderTable() {
       ? `${filtered.length} 条记录`
       : `显示 ${filtered.length} / ${app.items.length} 条`;
   dom.resetFilters.hidden = !hasFilters();
+  if (typeof renderWorkbenchChrome === "function") renderWorkbenchChrome();
 }
 
 function renderWorkspaceMeta() {
@@ -1009,6 +1103,13 @@ function applyState(data) {
   app.tags = Array.isArray(data.tags) ? data.tags : [];
   app.fields = Array.isArray(data.fields) ? data.fields : [];
   app.repositories = Array.isArray(data.repositories) ? data.repositories : [];
+  app.actions = Array.isArray(data.actions) ? data.actions : [];
+  app.latestRuns = data.latest_runs || {};
+  app.activeRuns = data.active_runs || 0;
+  const knownIDs = new Set(app.items.map((item) => item.id));
+  for (const id of [...app.selected]) {
+    if (!knownIDs.has(id)) app.selected.delete(id);
+  }
   app.loadError = "";
   if (
     app.filters.tag &&
@@ -2033,7 +2134,7 @@ function renderRepoManageList() {
 }
 
 function resetFilters() {
-  app.filters = { query: "", state: "", kind: "", tag: "", repos: [], stale: false };
+  app.filters = { query: "", state: "", kind: "", tag: "", repos: [], stale: false, view: "" };
   dom.searchInput.value = "";
   renderFilterOptions();
   renderStats();
@@ -2121,10 +2222,38 @@ function bindEvents() {
   dom.tableBody.addEventListener("click", (event) => {
     const action = event.target.closest("[data-action]");
     if (action) {
+      if (action.dataset.action === "sync") {
+        startSync();
+        return;
+      }
+      if (action.dataset.action === "reset") {
+        resetFilters();
+        return;
+      }
       const item = app.items.find(
         (candidate) => String(candidate.id) === action.dataset.itemId,
       );
       if (!item) return;
+      if (action.dataset.action === "select-item") {
+        if (action.checked) app.selected.add(item.id);
+        else app.selected.delete(item.id);
+        action.closest("tr")?.classList.toggle("is-selected", action.checked);
+        renderTableHead();
+        renderWorkbenchChrome();
+        return;
+      }
+      if (action.dataset.action === "open-item") {
+        openItemDrawer(item.id);
+        return;
+      }
+      if (action.dataset.action === "run-item") {
+        openRunDialog([item.id]);
+        return;
+      }
+      if (action.dataset.action === "open-run") {
+        openItemDrawer(item.id, { tab: "ai", runID: Number(action.dataset.runId) || null });
+        return;
+      }
       if (action.dataset.action === "edit-tags") {
         openTagPicker(action, item);
       } else if (action.dataset.action === "edit-field") {
@@ -2134,10 +2263,6 @@ function bindEvents() {
         if (!field) return;
         if (field.type === "checkbox") toggleCheckboxField(item, field, action);
         else openFieldEditor(action, item, field);
-      } else if (action.dataset.action === "sync") {
-        startSync();
-      } else if (action.dataset.action === "reset") {
-        resetFilters();
       }
     }
   });
@@ -2328,7 +2453,8 @@ function cacheDom() {
 async function init() {
   cacheDom();
   bindEvents();
+  if (typeof initWorkbench === "function") initWorkbench();
   await loadState();
 }
 
-init();
+document.addEventListener("DOMContentLoaded", init);

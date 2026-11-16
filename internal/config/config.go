@@ -13,14 +13,24 @@ import (
 const configVersion = 1
 
 type SyncConfig struct {
-	StaleDays        int `yaml:"stale_days"`
-	ReviewStaleDays  int `yaml:"review_stale_days"`
-	ClosedWindowDays int `yaml:"closed_window_days"`
-	RequestPageSize  int `yaml:"request_page_size"`
+	StaleDays        int `yaml:"stale_days" json:"stale_days"`
+	ReviewStaleDays  int `yaml:"review_stale_days" json:"review_stale_days"`
+	ClosedWindowDays int `yaml:"closed_window_days" json:"closed_window_days"`
+	RequestPageSize  int `yaml:"request_page_size" json:"request_page_size"`
 }
 
 type ServerConfig struct {
 	Port int `yaml:"port"`
+}
+
+type AgentConfig struct {
+	ClaudeCommand  string `yaml:"claude_command,omitempty" json:"claude_command"`
+	CodexCommand   string `yaml:"codex_command,omitempty" json:"codex_command"`
+	ClaudeModel    string `yaml:"claude_model,omitempty" json:"claude_model"`
+	CodexModel     string `yaml:"codex_model,omitempty" json:"codex_model"`
+	MaxConcurrent  int    `yaml:"max_concurrent" json:"max_concurrent"`
+	TimeoutMinutes int    `yaml:"timeout_minutes" json:"timeout_minutes"`
+	WorkspaceDir   string `yaml:"workspace_dir,omitempty" json:"workspace_dir"`
 }
 
 type RepoConfig struct {
@@ -52,12 +62,15 @@ type Config struct {
 	Repos   []RepoConfig `yaml:"repos"`
 	Sync    SyncConfig   `yaml:"sync"`
 	Server  ServerConfig `yaml:"server"`
+	Agent   AgentConfig  `yaml:"agent"`
 }
 
 type Paths struct {
-	Home       string
-	ConfigFile string
-	DBFile     string
+	Home         string
+	ConfigFile   string
+	DBFile       string
+	WorkspaceDir string
+	RunsDir      string
 }
 
 func Default() *Config {
@@ -71,6 +84,10 @@ func Default() *Config {
 			RequestPageSize:  100,
 		},
 		Server: ServerConfig{Port: 8787},
+		Agent: AgentConfig{
+			MaxConcurrent:  2,
+			TimeoutMinutes: 30,
+		},
 	}
 }
 
@@ -95,17 +112,44 @@ func ResolvePaths(homeOverride string) (Paths, error) {
 		return Paths{}, fmt.Errorf("无法解析配置目录: %w", err)
 	}
 	return Paths{
-		Home:       absolute,
-		ConfigFile: filepath.Join(absolute, "config.yml"),
-		DBFile:     filepath.Join(absolute, "gh-manager.db"),
+		Home:         absolute,
+		ConfigFile:   filepath.Join(absolute, "config.yml"),
+		DBFile:       filepath.Join(absolute, "gh-manager.db"),
+		WorkspaceDir: filepath.Join(absolute, "workspaces"),
+		RunsDir:      filepath.Join(absolute, "runs"),
 	}, nil
+}
+
+// LoadOrCreate 读取配置；文件不存在时写入默认配置，便于直接通过网页完成初始化。
+func LoadOrCreate(path string) (*Config, bool, error) {
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		cfg := Default()
+		if err := Save(path, cfg); err != nil {
+			return nil, false, err
+		}
+		return cfg, true, nil
+	}
+	cfg, err := Load(path)
+	return cfg, false, err
+}
+
+// ResolveWorkspaceDir 返回 Agent 工作区目录，未配置时使用默认目录。
+func (p Paths) ResolveWorkspaceDir(cfg *Config) string {
+	if cfg != nil && strings.TrimSpace(cfg.Agent.WorkspaceDir) != "" {
+		if expanded, err := expandHome(strings.TrimSpace(cfg.Agent.WorkspaceDir)); err == nil {
+			if absolute, err := filepath.Abs(expanded); err == nil {
+				return absolute
+			}
+		}
+	}
+	return p.WorkspaceDir
 }
 
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("配置文件不存在，请先运行 gh-manager init: %s", path)
+			return nil, fmt.Errorf("配置文件不存在: %s", path)
 		}
 		return nil, fmt.Errorf("读取配置失败: %w", err)
 	}
@@ -180,6 +224,23 @@ func (c *Config) Normalize() {
 	if c.Server.Port == 0 {
 		c.Server.Port = 8787
 	}
+	c.Agent.ClaudeCommand = strings.TrimSpace(c.Agent.ClaudeCommand)
+	c.Agent.CodexCommand = strings.TrimSpace(c.Agent.CodexCommand)
+	c.Agent.ClaudeModel = strings.TrimSpace(c.Agent.ClaudeModel)
+	c.Agent.CodexModel = strings.TrimSpace(c.Agent.CodexModel)
+	c.Agent.WorkspaceDir = strings.TrimSpace(c.Agent.WorkspaceDir)
+	if c.Agent.MaxConcurrent <= 0 {
+		c.Agent.MaxConcurrent = 2
+	}
+	if c.Agent.MaxConcurrent > 8 {
+		c.Agent.MaxConcurrent = 8
+	}
+	if c.Agent.TimeoutMinutes <= 0 {
+		c.Agent.TimeoutMinutes = 30
+	}
+	if c.Agent.TimeoutMinutes > 240 {
+		c.Agent.TimeoutMinutes = 240
+	}
 }
 
 func (c *Config) Validate() error {
@@ -196,6 +257,11 @@ func (c *Config) Validate() error {
 	}
 	if c.Server.Port < 1 || c.Server.Port > 65535 {
 		return fmt.Errorf("端口必须在 1-65535 之间: %d", c.Server.Port)
+	}
+	for _, model := range []string{c.Agent.ClaudeModel, c.Agent.CodexModel} {
+		if strings.ContainsAny(model, " \t\r\n") || strings.HasPrefix(model, "-") {
+			return fmt.Errorf("模型名无效: %q", model)
+		}
 	}
 	return nil
 }

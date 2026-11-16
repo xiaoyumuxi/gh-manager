@@ -82,11 +82,20 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("初始化默认标签失败: %w", err)
 		}
 	}
+	if err := seedDefaultActions(ctx, tx, now); err != nil {
+		return fmt.Errorf("初始化默认操作失败: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO meta (key, value) VALUES ('schema_version', '2')
+		`INSERT INTO meta (key, value) VALUES ('schema_version', '3')
 		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
 	); err != nil {
 		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE agent_runs SET status = 'failed', error = '服务重启，任务已中断', finished_at = ?
+		 WHERE status IN ('queued', 'preparing', 'running')`, now,
+	); err != nil {
+		return fmt.Errorf("清理中断的 Agent 任务失败: %w", err)
 	}
 	return tx.Commit()
 }
@@ -196,6 +205,12 @@ func upsertItem(ctx context.Context, tx *sql.Tx, repo string, item GitHubItem, n
 		return fmt.Errorf("读取条目失败 %s#%d: %w", repo, item.Number, err)
 	}
 
+	metadata := []byte("{}")
+	if item.PR != nil {
+		if encoded, err := json.Marshal(item.PR); err == nil {
+			metadata = encoded
+		}
+	}
 	createdAt := nullableTime(item.CreatedAt)
 	updatedAt := nullableTime(item.UpdatedAt)
 	closedAt := nullableOptionalTime(item.ClosedAt)
@@ -211,12 +226,12 @@ func upsertItem(ctx context.Context, tx *sql.Tx, repo string, item GitHubItem, n
 				source, repo, number, kind, title, url, state, is_draft, author, body,
 				labels_json, assignees_json, reviewers_json, milestone, review_decision,
 				ci_status, mergeable, comments_count, created_at, updated_at, closed_at,
-				merged_at, first_seen_at, last_seen_at, synced_at
-			) VALUES ('github', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				merged_at, first_seen_at, last_seen_at, synced_at, metadata
+			) VALUES ('github', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			repo, item.Number, item.Kind, item.Title, item.URL, item.State, draft, item.Author, item.Body,
 			string(labelsJSON), string(assigneesJSON), string(reviewersJSON), item.Milestone,
 			item.ReviewDecision, item.CIStatus, item.Mergeable, item.Comments, createdAt, updatedAt,
-			closedAt, mergedAt, dbTime(now), dbTime(now), dbTime(now),
+			closedAt, mergedAt, dbTime(now), dbTime(now), dbTime(now), string(metadata),
 		)
 		if err != nil {
 			return fmt.Errorf("插入条目失败 %s#%d: %w", repo, item.Number, err)
@@ -230,12 +245,12 @@ func upsertItem(ctx context.Context, tx *sql.Tx, repo string, item GitHubItem, n
 			labels_json = ?, assignees_json = ?, reviewers_json = ?, milestone = ?,
 			review_decision = ?, ci_status = ?, mergeable = ?, comments_count = ?,
 			created_at = ?, updated_at = ?, closed_at = ?, merged_at = ?,
-			last_seen_at = ?, synced_at = ?
+			last_seen_at = ?, synced_at = ?, metadata = ?
 		 WHERE id = ?`,
 		item.Title, item.URL, item.State, draft, item.Author, item.Body,
 		string(labelsJSON), string(assigneesJSON), string(reviewersJSON), item.Milestone,
 		item.ReviewDecision, item.CIStatus, item.Mergeable, item.Comments,
-		createdAt, updatedAt, closedAt, mergedAt, dbTime(now), dbTime(now), existingID,
+		createdAt, updatedAt, closedAt, mergedAt, dbTime(now), dbTime(now), string(metadata), existingID,
 	)
 	if err != nil {
 		return fmt.Errorf("更新条目失败 %s#%d: %w", repo, item.Number, err)
@@ -258,12 +273,60 @@ func upsertItem(ctx context.Context, tx *sql.Tx, repo string, item GitHubItem, n
 	return nil
 }
 
+const itemColumns = `id, source, repo, number, kind, title, url, state, is_draft, author, body,
+	labels_json, assignees_json, reviewers_json, milestone, review_decision,
+	ci_status, mergeable, comments_count, created_at, updated_at, closed_at,
+	merged_at, first_seen_at, last_seen_at, metadata`
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanItem(row rowScanner) (Item, error) {
+	var item Item
+	var draft int
+	var labelsJSON, assigneesJSON, reviewersJSON, metadata string
+	var createdAt, updatedAt, closedAt, mergedAt sql.NullString
+	if err := row.Scan(
+		&item.ID, &item.Source, &item.Repo, &item.Number, &item.Kind, &item.Title,
+		&item.URL, &item.State, &draft, &item.Author, &item.Body, &labelsJSON,
+		&assigneesJSON, &reviewersJSON, &item.Milestone, &item.ReviewDecision,
+		&item.CIStatus, &item.Mergeable, &item.Comments, &createdAt, &updatedAt,
+		&closedAt, &mergedAt, &item.FirstSeenAt, &item.LastSeenAt, &metadata,
+	); err != nil {
+		return Item{}, err
+	}
+	item.IsDraft = draft == 1
+	item.CreatedAt = parseNullableTime(createdAt)
+	item.UpdatedAt = parseNullableTime(updatedAt)
+	item.ClosedAt = parseNullableTime(closedAt)
+	item.MergedAt = parseNullableTime(mergedAt)
+	_ = json.Unmarshal([]byte(labelsJSON), &item.Labels)
+	_ = json.Unmarshal([]byte(assigneesJSON), &item.Assignees)
+	_ = json.Unmarshal([]byte(reviewersJSON), &item.Reviewers)
+	if item.Kind == "pr" && metadata != "" && metadata != "{}" {
+		var pr PRMeta
+		if json.Unmarshal([]byte(metadata), &pr) == nil && pr.HeadRef != "" {
+			item.PR = &pr
+		}
+	}
+	item.Tags = []Tag{}
+	item.Fields = map[string]any{}
+	return item, nil
+}
+
+// GetItem 读取单个条目（不含标签和字段值）。
+func (s *Store) GetItem(ctx context.Context, id int64) (Item, error) {
+	item, err := scanItem(s.db.QueryRowContext(ctx, `SELECT `+itemColumns+` FROM items WHERE id = ?`, id))
+	if err != nil {
+		return Item{}, normalizeNotFound(err)
+	}
+	return item, nil
+}
+
 func (s *Store) ListItems(ctx context.Context) ([]Item, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, source, repo, number, kind, title, url, state, is_draft, author, body,
-			labels_json, assignees_json, reviewers_json, milestone, review_decision,
-			ci_status, mergeable, comments_count, created_at, updated_at, closed_at,
-			merged_at, first_seen_at, last_seen_at
+		`SELECT `+itemColumns+`
 		 FROM items ORDER BY COALESCE(updated_at, '') DESC, repo, number DESC`,
 	)
 	if err != nil {
@@ -274,29 +337,10 @@ func (s *Store) ListItems(ctx context.Context) ([]Item, error) {
 	items := make([]Item, 0)
 	ids := make([]int64, 0)
 	for rows.Next() {
-		var item Item
-		var draft int
-		var labelsJSON, assigneesJSON, reviewersJSON string
-		var createdAt, updatedAt, closedAt, mergedAt sql.NullString
-		if err := rows.Scan(
-			&item.ID, &item.Source, &item.Repo, &item.Number, &item.Kind, &item.Title,
-			&item.URL, &item.State, &draft, &item.Author, &item.Body, &labelsJSON,
-			&assigneesJSON, &reviewersJSON, &item.Milestone, &item.ReviewDecision,
-			&item.CIStatus, &item.Mergeable, &item.Comments, &createdAt, &updatedAt,
-			&closedAt, &mergedAt, &item.FirstSeenAt, &item.LastSeenAt,
-		); err != nil {
+		item, err := scanItem(rows)
+		if err != nil {
 			return nil, err
 		}
-		item.IsDraft = draft == 1
-		item.CreatedAt = parseNullableTime(createdAt)
-		item.UpdatedAt = parseNullableTime(updatedAt)
-		item.ClosedAt = parseNullableTime(closedAt)
-		item.MergedAt = parseNullableTime(mergedAt)
-		_ = json.Unmarshal([]byte(labelsJSON), &item.Labels)
-		_ = json.Unmarshal([]byte(assigneesJSON), &item.Assignees)
-		_ = json.Unmarshal([]byte(reviewersJSON), &item.Reviewers)
-		item.Tags = []Tag{}
-		item.Fields = map[string]any{}
 		items = append(items, item)
 		ids = append(ids, item.ID)
 	}
