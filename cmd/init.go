@@ -61,7 +61,10 @@ func newInitCommand() *cobra.Command {
 			}
 
 			cfg := config.Default()
-			cfg.Repos = allRepos
+			cfg.Repos = make([]config.RepoConfig, 0, len(allRepos))
+			for _, repo := range allRepos {
+				cfg.Repos = append(cfg.Repos, config.RepoConfig{Name: repo})
+			}
 			if port > 0 {
 				cfg.Server.Port = port
 			}
@@ -84,7 +87,7 @@ func newInitCommand() *cobra.Command {
 			fmt.Fprintf(cmd.OutOrStdout(), "配置已写入 %s\n", paths.ConfigFile)
 			fmt.Fprintf(cmd.OutOrStdout(), "已添加 %d 个仓库：\n", len(cfg.Repos))
 			for _, repo := range cfg.Repos {
-				fmt.Fprintf(cmd.OutOrStdout(), "  - %s\n", repo)
+				fmt.Fprintf(cmd.OutOrStdout(), "  - %s\n", repo.Name)
 			}
 			fmt.Fprintln(cmd.OutOrStdout(), "下一步运行: gh-manager sync")
 			return nil
@@ -108,8 +111,7 @@ func splitRepos(values []string) []string {
 		for _, repo := range strings.FieldsFunc(value, func(r rune) bool {
 			return r == ',' || r == '\n' || r == '\r' || r == '\t' || r == ' '
 		}) {
-			repo = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(repo, "https://github.com/"), ".git"))
-			repo = strings.Trim(repo, "/")
+			repo = config.NormalizeRepoName(repo)
 			if repo == "" {
 				continue
 			}

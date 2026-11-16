@@ -89,8 +89,12 @@ CREATE INDEX IF NOT EXISTS item_snapshots_item_idx ON item_snapshots (item_id, c
 
 CREATE TABLE IF NOT EXISTS repos (
 	full_name TEXT PRIMARY KEY COLLATE NOCASE,
+	tracked_branch TEXT NOT NULL DEFAULT '',
 	last_synced_at TEXT NOT NULL DEFAULT '',
-	last_error TEXT NOT NULL DEFAULT ''
+	last_error TEXT NOT NULL DEFAULT '',
+	commit_sha TEXT NOT NULL DEFAULT '',
+	commit_message TEXT NOT NULL DEFAULT '',
+	commit_committed_at TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS sync_runs (

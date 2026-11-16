@@ -20,6 +20,10 @@
         <small>GitHub issue &amp; PR workspace</small>
       </span>
     </a>
+    <button class="button button-quiet manager-entry" id="manageRepos" type="button">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 5.5h13M3.5 10h13M3.5 14.5h13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="6" cy="5.5" r="1.5" fill="currentColor"/><circle cx="13" cy="10" r="1.5" fill="currentColor"/><circle cx="8" cy="14.5" r="1.5" fill="currentColor"/></svg>
+      <span>管理仓库</span>
+    </button>
     <div class="header-actions">
       <div class="sync-state" id="syncState" title="同步状态">
         <span class="sync-dot" id="syncDot" aria-hidden="true"></span>
@@ -83,6 +87,12 @@
             <option value="">全部</option>
           </select>
         </label>
+        <button class="filter-menu-button" id="repoFilterButton" type="button" aria-haspopup="dialog" aria-expanded="false">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 5.5h13M5.5 10h9M8 14.5h4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          <span id="repoFilterLabel">仓库</span>
+          <span class="filter-count" id="repoFilterCount" hidden>0</span>
+          <svg class="filter-chevron" viewBox="0 0 20 20" aria-hidden="true"><path d="m6.5 8 3.5 3.5L13.5 8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
         <label class="toggle">
           <input id="staleFilter" type="checkbox">
           <span>仅看停滞</span>
@@ -189,6 +199,38 @@
       </form>
       <div class="dialog-section-title">已有字段</div>
       <div class="dialog-list" id="fieldManageList"></div>
+    </div>
+  </dialog>
+
+  <dialog class="dialog dialog-wide" id="reposDialog">
+    <div class="dialog-card">
+      <header class="dialog-header">
+        <div>
+          <p class="eyebrow">REPOSITORIES</p>
+          <h2>管理仓库</h2>
+        </div>
+        <button class="icon-button dialog-close" type="button" data-close-dialog="reposDialog" aria-label="关闭">
+          <svg viewBox="0 0 20 20"><path d="m5 5 10 10M15 5 5 15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        </button>
+      </header>
+
+      <form class="field-form repo-create-form" id="repoCreateForm">
+        <div class="repo-create-grid">
+          <label class="stack-field">
+            <span>仓库</span>
+            <input id="newRepoName" type="text" placeholder="owner/repo 或 GitHub 链接" autocomplete="off" required>
+          </label>
+          <label class="stack-field">
+            <span>追踪分支</span>
+            <input id="newRepoBranch" type="text" placeholder="留空跟随默认分支" autocomplete="off">
+          </label>
+          <button class="button button-primary" type="submit">添加仓库</button>
+        </div>
+        <p class="form-hint repo-create-hint">添加时会通过 GitHub CLI 验证仓库与分支；留空时自动跟随默认分支。</p>
+      </form>
+
+      <div class="dialog-section-title">追踪中的仓库</div>
+      <div class="dialog-list repo-manage-list" id="repoManageList"></div>
     </div>
   </dialog>
 </body>

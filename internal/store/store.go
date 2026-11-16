@@ -65,6 +65,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("初始化数据库结构失败: %w", err)
 	}
+	if err := s.ensureRepoColumns(ctx); err != nil {
+		return fmt.Errorf("升级仓库状态结构失败: %w", err)
+	}
 	now := dbTime(time.Now())
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -80,12 +83,59 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO meta (key, value) VALUES ('schema_version', '1')
+		`INSERT INTO meta (key, value) VALUES ('schema_version', '2')
 		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
 	); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+func (s *Store) ensureRepoColumns(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(repos)`)
+	if err != nil {
+		return err
+	}
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var (
+			cid          int
+			name         string
+			columnType   string
+			notNull      int
+			defaultValue sql.NullString
+			primaryKey   int
+		)
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return err
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	for _, column := range []string{
+		"tracked_branch",
+		"commit_sha",
+		"commit_message",
+		"commit_committed_at",
+	} {
+		if columns[column] {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx,
+			`ALTER TABLE repos ADD COLUMN `+column+` TEXT NOT NULL DEFAULT ''`,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) ApplyRepoSnapshot(ctx context.Context, repo string, items []GitHubItem, closeMissing bool, boundary time.Time) (int, error) {
@@ -667,25 +717,58 @@ func (s *Store) LatestSyncRun(ctx context.Context) (*SyncRun, error) {
 	return &run, nil
 }
 
-func (s *Store) SetRepoResult(ctx context.Context, fullName, errorText string) error {
-	now := dbTime(time.Now())
-	lastSynced := now
-	if errorText != "" {
-		lastSynced = ""
+func (s *Store) SaveRepoResult(ctx context.Context, result RepoResult) error {
+	lastSynced := ""
+	if result.Synced {
+		lastSynced = dbTime(time.Now())
+	}
+	updateHead := 0
+	if result.UpdateHead {
+		updateHead = 1
+	}
+	synced := 0
+	if result.Synced {
+		synced = 1
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO repos (full_name, last_synced_at, last_error) VALUES (?, ?, ?)
-		 ON CONFLICT(full_name) DO UPDATE SET
-			last_synced_at = CASE WHEN excluded.last_error = '' THEN excluded.last_synced_at ELSE repos.last_synced_at END,
-			last_error = excluded.last_error`,
-		fullName, lastSynced, errorText,
+		`INSERT INTO repos (
+			full_name, tracked_branch, last_synced_at, last_error,
+			commit_sha, commit_message, commit_committed_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(full_name) DO UPDATE SET
+			tracked_branch = CASE WHEN ? THEN excluded.tracked_branch ELSE repos.tracked_branch END,
+			last_synced_at = CASE WHEN ? THEN excluded.last_synced_at ELSE repos.last_synced_at END,
+			last_error = excluded.last_error,
+			commit_sha = CASE WHEN ? THEN excluded.commit_sha ELSE repos.commit_sha END,
+			commit_message = CASE WHEN ? THEN excluded.commit_message ELSE repos.commit_message END,
+			commit_committed_at = CASE WHEN ? THEN excluded.commit_committed_at ELSE repos.commit_committed_at END`,
+		result.FullName, result.TrackedBranch, lastSynced, result.LastError,
+		result.CommitSHA, result.CommitMessage, result.CommitCommittedAt,
+		updateHead, synced, updateHead, updateHead, updateHead,
 	)
 	return err
 }
 
+func (s *Store) DeleteRepoData(ctx context.Context, fullName string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM items WHERE repo = ?`, fullName); err != nil {
+		return fmt.Errorf("删除仓库记录失败: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM repos WHERE full_name = ?`, fullName); err != nil {
+		return fmt.Errorf("删除仓库状态失败: %w", err)
+	}
+	return tx.Commit()
+}
+
 func (s *Store) ListRepoStatuses(ctx context.Context) ([]RepoStatus, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT full_name, last_synced_at, last_error FROM repos ORDER BY full_name COLLATE NOCASE`,
+		`SELECT full_name, tracked_branch, last_synced_at, last_error,
+			commit_sha, commit_message, commit_committed_at
+		 FROM repos ORDER BY full_name COLLATE NOCASE`,
 	)
 	if err != nil {
 		return nil, err
@@ -694,7 +777,10 @@ func (s *Store) ListRepoStatuses(ctx context.Context) ([]RepoStatus, error) {
 	repos := make([]RepoStatus, 0)
 	for rows.Next() {
 		var repo RepoStatus
-		if err := rows.Scan(&repo.FullName, &repo.LastSynced, &repo.LastError); err != nil {
+		if err := rows.Scan(
+			&repo.FullName, &repo.TrackedBranch, &repo.LastSynced, &repo.LastError,
+			&repo.CommitSHA, &repo.CommitMessage, &repo.CommitCommittedAt,
+		); err != nil {
 			return nil, err
 		}
 		repos = append(repos, repo)

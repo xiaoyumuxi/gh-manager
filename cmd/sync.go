@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -27,7 +28,18 @@ func newSyncCommand() *cobra.Command {
 			}
 			repos := cfg.Repos
 			if len(args) > 0 {
-				repos = splitRepos(args)
+				branches := make(map[string]string, len(cfg.Repos))
+				for _, repo := range cfg.Repos {
+					branches[strings.ToLower(repo.Name)] = repo.Branch
+				}
+				requested := splitRepos(args)
+				repos = make([]config.RepoConfig, 0, len(requested))
+				for _, name := range requested {
+					repos = append(repos, config.RepoConfig{
+						Name:   name,
+						Branch: branches[strings.ToLower(name)],
+					})
+				}
 			}
 			if len(repos) == 0 {
 				return fmt.Errorf("没有可同步的仓库，请先运行 gh-manager init")

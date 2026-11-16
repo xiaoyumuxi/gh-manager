@@ -17,7 +17,7 @@ var ErrSyncBusy = errors.New("已有同步任务正在运行，请稍后再试")
 
 type SyncOptions struct {
 	Store            *store.Store
-	Repos            []string
+	Repos            []config.RepoConfig
 	PageSize         int
 	ClosedWindowDays int
 	Progress         func(string)
@@ -69,15 +69,19 @@ func Run(ctx context.Context, options SyncOptions) (Summary, error) {
 
 	cutoff := time.Now().UTC().AddDate(0, 0, -options.ClosedWindowDays)
 	successfulRepos := 0
-	for index, fullName := range options.Repos {
+	for index, repoConfig := range options.Repos {
 		if err := ctx.Err(); err != nil {
 			summary.Errors = append(summary.Errors, err.Error())
 			break
 		}
+		fullName := repoConfig.Name
 		ownerName, repoName, err := config.SplitRepo(fullName)
 		if err != nil {
 			summary.Errors = append(summary.Errors, err.Error())
-			_ = options.Store.SetRepoResult(ctx, fullName, err.Error())
+			_ = options.Store.SaveRepoResult(ctx, store.RepoResult{
+				FullName:  fullName,
+				LastError: err.Error(),
+			})
 			continue
 		}
 		progress(fmt.Sprintf("[%d/%d] 同步 %s", index+1, len(options.Repos), fullName))
@@ -85,6 +89,8 @@ func Run(ctx context.Context, options SyncOptions) (Summary, error) {
 
 		items := make([]store.GitHubItem, 0)
 		var fetchErrors []string
+		head, err := client.repositoryHead(ctx, ownerName, repoName, repoConfig.Branch)
+		fetchErrors = appendFetchError(fetchErrors, "仓库最新提交", err)
 
 		openIssues, complete, err := client.listIssues(ctx, ownerName, repoName, options.PageSize, false, cutoff)
 		fetchErrors = appendFetchError(fetchErrors, "issue/open", err)
@@ -118,10 +124,21 @@ func Run(ctx context.Context, options SyncOptions) (Summary, error) {
 		if len(fetchErrors) > 0 {
 			errorText := strings.Join(fetchErrors, "; ")
 			summary.Errors = append(summary.Errors, fullName+": "+errorText)
-			_ = options.Store.SetRepoResult(ctx, fullName, errorText)
+			_ = options.Store.SaveRepoResult(ctx, store.RepoResult{
+				FullName:  fullName,
+				LastError: errorText,
+			})
 		} else {
 			successfulRepos++
-			_ = options.Store.SetRepoResult(ctx, fullName, "")
+			_ = options.Store.SaveRepoResult(ctx, store.RepoResult{
+				FullName:          fullName,
+				TrackedBranch:     head.Branch,
+				CommitSHA:         head.SHA,
+				CommitMessage:     head.Message,
+				CommitCommittedAt: head.CommittedAt.UTC().Format(time.RFC3339),
+				Synced:            true,
+				UpdateHead:        true,
+			})
 		}
 	}
 

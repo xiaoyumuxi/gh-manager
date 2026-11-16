@@ -92,9 +92,24 @@ type SyncRun struct {
 }
 
 type RepoStatus struct {
-	FullName   string `json:"full_name"`
-	LastSynced string `json:"last_synced_at"`
-	LastError  string `json:"last_error"`
+	FullName          string `json:"full_name"`
+	TrackedBranch     string `json:"tracked_branch"`
+	LastSynced        string `json:"last_synced_at"`
+	LastError         string `json:"last_error"`
+	CommitSHA         string `json:"commit_sha"`
+	CommitMessage     string `json:"commit_message"`
+	CommitCommittedAt string `json:"commit_committed_at"`
+}
+
+type RepoResult struct {
+	FullName          string
+	TrackedBranch     string
+	LastError         string
+	CommitSHA         string
+	CommitMessage     string
+	CommitCommittedAt string
+	Synced            bool
+	UpdateHead        bool
 }
 
 type SyncSummary struct {

@@ -3,7 +3,8 @@ const app = {
   items: [],
   tags: [],
   fields: [],
-  filters: { query: "", state: "", kind: "", tag: "", stale: false },
+  repositories: [],
+  filters: { query: "", state: "", kind: "", tag: "", repos: [], stale: false },
   sort: { key: "updated_at", direction: "desc" },
   pollTimer: null,
   loadError: "",
@@ -258,12 +259,31 @@ function fieldValue(item, field) {
   return item.fields ? item.fields[String(field.id)] : undefined;
 }
 
+function sameRepo(left, right) {
+  return String(left).toLocaleLowerCase() === String(right).toLocaleLowerCase();
+}
+
+function repoStatus(fullName) {
+  return (app.data?.repo_statuses || []).find((repo) =>
+    sameRepo(repo.full_name, fullName),
+  );
+}
+
+function repoItemCount(fullName) {
+  return app.items.filter((item) => sameRepo(item.repo, fullName)).length;
+}
+
+function syncIsRunning() {
+  return Boolean(app.data?.sync_status?.running ?? app.data?.syncing);
+}
+
 function hasFilters() {
   return Boolean(
     app.filters.query ||
       app.filters.state ||
       app.filters.kind ||
       app.filters.tag ||
+      app.filters.repos.length ||
       app.filters.stale,
   );
 }
@@ -279,6 +299,12 @@ function applyFilters() {
     }
     if (app.filters.kind && item.kind !== app.filters.kind) return false;
     if (app.filters.tag && !currentTags(item).some((tag) => String(tag.id) === app.filters.tag)) {
+      return false;
+    }
+    if (
+      app.filters.repos.length &&
+      !app.filters.repos.some((repo) => sameRepo(repo, item.repo))
+    ) {
       return false;
     }
     if (app.filters.stale && !item.stale && !item.review_stale) return false;
@@ -911,6 +937,21 @@ function renderFilterOptions() {
     app.filters.tag = "";
     dom.tagFilter.value = "";
   }
+
+  const repoNames = new Set(app.repositories.map((repo) => repo.name.toLowerCase()));
+  app.filters.repos = app.filters.repos.filter((repo) =>
+    repoNames.has(String(repo).toLowerCase()),
+  );
+  const selectedCount = app.filters.repos.length;
+  dom.repoFilterButton.classList.toggle("is-active", selectedCount > 0);
+  dom.repoFilterLabel.textContent =
+    selectedCount === 1 ? app.filters.repos[0] : "仓库";
+  dom.repoFilterCount.hidden = selectedCount === 0;
+  dom.repoFilterCount.textContent = String(selectedCount);
+  dom.repoFilterButton.title =
+    selectedCount === 0
+      ? "按仓库筛选，可多选"
+      : `已选择 ${selectedCount} 个仓库`;
 }
 
 function renderFooter() {
@@ -936,6 +977,7 @@ function renderSyncUI(status = null) {
   const lastSync = app.data?.last_sync;
   const running = Boolean(state.running ?? app.data?.syncing);
   dom.syncButton.disabled = running;
+  updateRepoManagementState(running);
   const label = dom.syncButton.querySelector("span");
   if (label) label.textContent = running ? "同步中…" : "同步 GitHub";
   dom.syncDot.className = "sync-dot";
@@ -966,12 +1008,18 @@ function applyState(data) {
   app.items = Array.isArray(data.items) ? data.items : [];
   app.tags = Array.isArray(data.tags) ? data.tags : [];
   app.fields = Array.isArray(data.fields) ? data.fields : [];
+  app.repositories = Array.isArray(data.repositories) ? data.repositories : [];
   app.loadError = "";
   if (
     app.filters.tag &&
     !app.tags.some((tag) => String(tag.id) === app.filters.tag)
   ) {
     app.filters.tag = "";
+  }
+  if (app.filters.repos.length) {
+    app.filters.repos = app.filters.repos.filter((repo) =>
+      app.repositories.some((candidate) => sameRepo(candidate.name, repo)),
+    );
   }
   renderWorkspaceMeta();
   renderStats();
@@ -980,6 +1028,7 @@ function applyState(data) {
   renderFooter();
   renderTagManageList();
   renderFieldManageList();
+  renderRepoManageList();
   renderSyncUI();
   if (data.syncing) startPolling();
 }
@@ -1000,16 +1049,17 @@ async function loadState({ silent = false } = {}) {
 function openPopover(anchor, content, { width = 320 } = {}) {
   closePopover();
   const popover = dom.popover;
+  const actualWidth = Math.min(width, window.innerWidth - 24);
   popover.hidden = false;
   popover.replaceChildren(content);
-  popover.style.width = `${width}px`;
+  popover.style.width = `${actualWidth}px`;
   popover.style.left = "0px";
   popover.style.top = "0px";
   const rect = anchor.getBoundingClientRect();
   const popoverRect = popover.getBoundingClientRect();
-  let left = Math.min(Math.max(12, rect.left), window.innerWidth - width - 12);
-  if (rect.left + width > window.innerWidth - 12) {
-    left = Math.max(12, rect.right - width);
+  let left = Math.min(Math.max(12, rect.left), window.innerWidth - actualWidth - 12);
+  if (rect.left + actualWidth > window.innerWidth - 12) {
+    left = Math.max(12, rect.right - actualWidth);
   }
   let top = rect.bottom + 7;
   if (top + popoverRect.height > window.innerHeight - 12) {
@@ -1023,10 +1073,155 @@ function openPopover(anchor, content, { width = 320 } = {}) {
 function closePopover() {
   dom.popover.hidden = true;
   dom.popover.replaceChildren();
+  if (dom.repoFilterButton) {
+    dom.repoFilterButton.setAttribute("aria-expanded", "false");
+  }
   if (popoverCleanup) {
     popoverCleanup();
     popoverCleanup = null;
   }
+}
+
+function openRepoFilter(anchor) {
+  let query = "";
+  const search = h("input", {
+    class: "popover-search",
+    type: "search",
+    placeholder: "搜索仓库",
+    autocomplete: "off",
+  });
+  const list = h("div", { class: "picker-list repo-picker-list" });
+  const selectedCount = h("small", { text: "" });
+  const recordCount = h("span", { text: "" });
+  const content = h(
+    "div",
+    { class: "field-editor" },
+    h(
+      "div",
+      { class: "popover-title" },
+      h("span", { text: "按仓库筛选" }),
+      selectedCount,
+    ),
+    search,
+    h(
+      "div",
+      { class: "popover-bulk-actions" },
+      h("button", {
+        class: "link-button",
+        type: "button",
+        text: "全选",
+        onclick: () => {
+          app.filters.repos = app.repositories.map((repo) => repo.name);
+          updateRepoFilter();
+        },
+      }),
+      h("span", { class: "popover-action-divider", text: "·" }),
+      h("button", {
+        class: "link-button",
+        type: "button",
+        text: "清空",
+        onclick: () => {
+          app.filters.repos = [];
+          updateRepoFilter();
+        },
+      }),
+    ),
+    list,
+    h(
+      "div",
+      { class: "popover-footer" },
+      recordCount,
+      h("button", {
+        class: "link-button",
+        type: "button",
+        text: "管理仓库",
+        onclick: () => {
+          closePopover();
+          openReposDialog();
+        },
+      }),
+    ),
+  );
+  openPopover(anchor, content, { width: 340 });
+  anchor.setAttribute("aria-expanded", "true");
+  setTimeout(() => search.focus(), 0);
+
+  function updateRepoFilter() {
+    renderFilterOptions();
+    renderStats();
+    renderTable();
+    draw();
+  }
+
+  function draw() {
+    const lower = query.trim().toLocaleLowerCase("zh-CN");
+    const repos = app.repositories
+      .filter((repo) => !lower || repo.name.toLocaleLowerCase("zh-CN").includes(lower))
+      .sort((left, right) => {
+        const leftSelected = app.filters.repos.some((repo) => sameRepo(repo, left.name));
+        const rightSelected = app.filters.repos.some((repo) => sameRepo(repo, right.name));
+        if (leftSelected !== rightSelected) return leftSelected ? -1 : 1;
+        return left.name.localeCompare(right.name, "zh-CN");
+      });
+    selectedCount.textContent = `${app.filters.repos.length} 个已选`;
+    recordCount.textContent = `${applyFilters().length} 条匹配记录`;
+    if (!repos.length) {
+      list.replaceChildren(
+        h("div", {
+          class: "popover-empty",
+          text: app.repositories.length ? "没有匹配的仓库" : "还没有追踪的仓库",
+        }),
+      );
+      return;
+    }
+    list.replaceChildren(
+      ...repos.map((repo) => {
+        const checked = app.filters.repos.some((selected) =>
+          sameRepo(selected, repo.name),
+        );
+        const checkbox = h("input", { type: "checkbox", checked });
+        checkbox.addEventListener("change", () => {
+          if (checkbox.checked) {
+            if (!app.filters.repos.some((selected) => sameRepo(selected, repo.name))) {
+              app.filters.repos.push(repo.name);
+            }
+          } else {
+            app.filters.repos = app.filters.repos.filter(
+              (selected) => !sameRepo(selected, repo.name),
+            );
+          }
+          updateRepoFilter();
+        });
+        const status = repoStatus(repo.name);
+        return h(
+          "label",
+          { class: "picker-row repo-picker-row" },
+          checkbox,
+          h(
+            "span",
+            { class: "repo-picker-copy" },
+            h("span", { class: "picker-name", text: repo.name, title: repo.name }),
+            h("span", {
+              class: "repo-picker-branch",
+              text: status?.tracked_branch
+                ? `分支 ${status.tracked_branch}`
+                : repo.branch
+                  ? `分支 ${repo.branch}`
+                  : "默认分支",
+            }),
+          ),
+          h("span", { class: "picker-count", text: String(repoItemCount(repo.name)) }),
+        );
+      }),
+    );
+  }
+
+  search.addEventListener("input", () => {
+    query = search.value;
+    draw();
+  });
+  popoverCleanup = () => {};
+  draw();
 }
 
 function applyTagCountDelta(beforeIDs, afterIDs) {
@@ -1640,8 +1835,205 @@ function renderFieldManageList() {
   dom.fieldManageList.replaceChildren(...rows);
 }
 
+function openReposDialog() {
+  renderRepoManageList();
+  if (!dom.reposDialog.open) dom.reposDialog.showModal();
+}
+
+function updateRepoManagementState(running = syncIsRunning()) {
+  if (!dom.manageRepos) return;
+  dom.manageRepos.disabled = running;
+  dom.manageRepos.title = running ? "同步进行中，暂时不能修改仓库" : "添加、删除或切换追踪分支";
+  if (dom.repoCreateForm) {
+    for (const control of dom.repoCreateForm.querySelectorAll("input, button")) {
+      control.disabled = running;
+    }
+  }
+  if (dom.repoManageList) {
+    for (const control of dom.repoManageList.querySelectorAll("input, button")) {
+      control.disabled = running;
+    }
+  }
+}
+
+function renderRepoManageList() {
+  if (!dom.repoManageList) return;
+  const running = syncIsRunning();
+  if (!app.repositories.length) {
+    dom.repoManageList.replaceChildren(
+      h("div", {
+        class: "popover-empty",
+        text: "还没有追踪的仓库。在上方输入 owner/repo 后添加。",
+      }),
+    );
+    updateRepoManagementState(running);
+    return;
+  }
+
+  const rows = app.repositories.map((repo) => {
+    const status = repoStatus(repo.name) || {};
+    const branch = h("input", {
+      class: "repo-branch-input",
+      type: "text",
+      value: repo.branch || "",
+      placeholder: "留空跟随默认分支",
+      autocomplete: "off",
+      disabled: running,
+    });
+    const save = h("button", {
+      class: "button button-small button-quiet",
+      type: "button",
+      text: "保存分支",
+      disabled: running,
+    });
+    const remove = h("button", {
+      class: "button button-small button-danger",
+      type: "button",
+      text: "删除",
+      disabled: running,
+    });
+
+    save.addEventListener("click", async () => {
+      save.disabled = true;
+      try {
+        await api("/api/repos", {
+          method: "PATCH",
+          body: { repo: repo.name, branch: branch.value.trim() },
+        });
+        await loadState({ silent: true });
+        toast("追踪分支已更新", "success");
+      } catch (error) {
+        toast(error.message);
+        save.disabled = false;
+      }
+    });
+
+    remove.addEventListener("click", async () => {
+      if (
+        !window.confirm(
+          `删除仓库「${repo.name}」？本地已同步的 Issue、PR 和标注也会一并清理。`,
+        )
+      ) {
+        return;
+      }
+      remove.disabled = true;
+      try {
+        await api(`/api/repos?repo=${encodeURIComponent(repo.name)}`, {
+          method: "DELETE",
+        });
+        await loadState({ silent: true });
+        toast("仓库已删除", "success");
+      } catch (error) {
+        toast(error.message);
+        remove.disabled = false;
+      }
+    });
+
+    const statusLabel = status.last_error
+      ? "同步异常"
+      : status.last_synced_at
+        ? "已同步"
+        : "尚未同步";
+    const statusTone = status.last_error
+      ? "is-error"
+      : status.last_synced_at
+        ? "is-success"
+        : "is-idle";
+    const actualBranch =
+      status.tracked_branch || repo.branch || "默认分支";
+    const commit = status.commit_sha
+      ? h(
+          "div",
+          { class: "repo-commit" },
+          h("span", {
+            class: "repo-commit-message",
+            text: status.commit_message || "（无提交标题）",
+            title: status.commit_message || "",
+          }),
+          h(
+            "a",
+            {
+              class: "repo-commit-link",
+              href: `https://github.com/${repo.name}/commit/${status.commit_sha}`,
+              target: "_blank",
+              rel: "noreferrer",
+              text: status.commit_sha.slice(0, 8),
+            },
+          ),
+          status.commit_committed_at
+            ? h("span", { text: formatShortDate(status.commit_committed_at) })
+            : null,
+        )
+      : h("div", { class: "repo-commit is-empty", text: "尚未获取到最新提交" });
+
+    return h(
+      "div",
+      { class: "repo-manage-row" },
+      h(
+        "div",
+        { class: "repo-manage-main" },
+        h(
+          "div",
+          { class: "repo-manage-heading" },
+          h(
+            "a",
+            {
+              class: "repo-manage-name",
+              href: `https://github.com/${repo.name}`,
+              target: "_blank",
+              rel: "noreferrer",
+              text: repo.name,
+            },
+          ),
+          h("span", {
+            class: `repo-status ${statusTone}`,
+            text: statusLabel,
+          }),
+        ),
+        commit,
+        h(
+          "div",
+          { class: "repo-manage-meta" },
+          h("span", { text: `实际追踪：${actualBranch}` }),
+          h("span", { text: `${repoItemCount(repo.name)} 条本地记录` }),
+          status.last_synced_at
+            ? h("span", {
+                text: `最近同步：${formatDateTime(status.last_synced_at)}`,
+                title: formatDateTime(status.last_synced_at),
+              })
+            : h("span", { text: "最近同步：尚未完成" }),
+        ),
+        status.last_error
+          ? h("p", {
+              class: "repo-error",
+              text: status.last_error,
+              title: status.last_error,
+            })
+          : null,
+      ),
+      h(
+        "div",
+        { class: "repo-branch-editor" },
+        h(
+          "label",
+          { class: "stack-field repo-branch-field" },
+          h("span", { text: "追踪分支" }),
+          branch,
+        ),
+        h("span", {
+          class: "repo-branch-note",
+          text: repo.branch ? `指定分支：${repo.branch}` : "配置为空时跟随默认分支",
+        }),
+        h("div", { class: "repo-row-actions" }, save, remove),
+      ),
+    );
+  });
+  dom.repoManageList.replaceChildren(...rows);
+  updateRepoManagementState(running);
+}
+
 function resetFilters() {
-  app.filters = { query: "", state: "", kind: "", tag: "", stale: false };
+  app.filters = { query: "", state: "", kind: "", tag: "", repos: [], stale: false };
   dom.searchInput.value = "";
   renderFilterOptions();
   renderStats();
@@ -1680,6 +2072,14 @@ function bindEvents() {
   });
   dom.resetFilters.addEventListener("click", resetFilters);
   dom.syncButton.addEventListener("click", startSync);
+  dom.repoFilterButton.addEventListener("click", () => {
+    if (!dom.popover.hidden) {
+      closePopover();
+      return;
+    }
+    openRepoFilter(dom.repoFilterButton);
+  });
+  dom.manageRepos.addEventListener("click", openReposDialog);
   dom.manageTags.addEventListener("click", openTagsDialog);
   dom.manageFields.addEventListener("click", openFieldsDialog);
 
@@ -1748,11 +2148,37 @@ function bindEvents() {
       if (dialog?.open) dialog.close();
     });
   }
-  for (const dialog of [dom.tagsDialog, dom.fieldsDialog]) {
+  for (const dialog of [dom.tagsDialog, dom.fieldsDialog, dom.reposDialog]) {
     dialog.addEventListener("click", (event) => {
       if (event.target === dialog) dialog.close();
     });
   }
+
+  dom.repoCreateForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const repo = dom.newRepoName.value.trim();
+    const branch = dom.newRepoBranch.value.trim();
+    if (!repo) return;
+    const submit = dom.repoCreateForm.querySelector('button[type="submit"]');
+    submit.disabled = true;
+    submit.textContent = "正在验证…";
+    try {
+      await api("/api/repos", {
+        method: "POST",
+        body: { repo, branch },
+      });
+      dom.newRepoName.value = "";
+      dom.newRepoBranch.value = "";
+      await loadState({ silent: true });
+      toast("仓库已添加", "success");
+      dom.newRepoName.focus();
+    } catch (error) {
+      toast(error.message);
+    } finally {
+      submit.textContent = "添加仓库";
+      updateRepoManagementState();
+    }
+  });
 
   dom.tagCreateForm.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -1814,6 +2240,7 @@ function bindEvents() {
   document.addEventListener("pointerdown", (event) => {
     if (dom.popover.hidden) return;
     if (dom.popover.contains(event.target)) return;
+    if (dom.repoFilterButton.contains(event.target)) return;
     closePopover();
   });
 
@@ -1866,6 +2293,10 @@ function cacheDom() {
   dom.tagFilter = document.getElementById("tagFilter");
   dom.staleFilter = document.getElementById("staleFilter");
   dom.resetFilters = document.getElementById("resetFilters");
+  dom.repoFilterButton = document.getElementById("repoFilterButton");
+  dom.repoFilterLabel = document.getElementById("repoFilterLabel");
+  dom.repoFilterCount = document.getElementById("repoFilterCount");
+  dom.manageRepos = document.getElementById("manageRepos");
   dom.manageTags = document.getElementById("manageTags");
   dom.manageFields = document.getElementById("manageFields");
   dom.tableScroller = document.getElementById("tableScroller");
@@ -1877,6 +2308,7 @@ function cacheDom() {
   dom.toast = document.getElementById("toast");
   dom.tagsDialog = document.getElementById("tagsDialog");
   dom.fieldsDialog = document.getElementById("fieldsDialog");
+  dom.reposDialog = document.getElementById("reposDialog");
   dom.tagCreateForm = document.getElementById("tagCreateForm");
   dom.newTagName = document.getElementById("newTagName");
   dom.newTagColor = document.getElementById("newTagColor");
@@ -1887,6 +2319,10 @@ function cacheDom() {
   dom.newFieldOptions = document.getElementById("newFieldOptions");
   dom.fieldOptionsWrap = document.getElementById("fieldOptionsWrap");
   dom.fieldManageList = document.getElementById("fieldManageList");
+  dom.repoCreateForm = document.getElementById("repoCreateForm");
+  dom.newRepoName = document.getElementById("newRepoName");
+  dom.newRepoBranch = document.getElementById("newRepoBranch");
+  dom.repoManageList = document.getElementById("repoManageList");
 }
 
 async function init() {

@@ -23,9 +23,33 @@ type ServerConfig struct {
 	Port int `yaml:"port"`
 }
 
+type RepoConfig struct {
+	Name   string `yaml:"name" json:"name"`
+	Branch string `yaml:"branch,omitempty" json:"branch,omitempty"`
+}
+
+func (r *RepoConfig) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		r.Name = node.Value
+		r.Branch = ""
+		return nil
+	case yaml.MappingNode:
+		type plain RepoConfig
+		var value plain
+		if err := node.Decode(&value); err != nil {
+			return err
+		}
+		*r = RepoConfig(value)
+		return nil
+	default:
+		return fmt.Errorf("仓库配置必须是 owner/name 字符串或包含 name 的对象")
+	}
+}
+
 type Config struct {
 	Version int          `yaml:"version"`
-	Repos   []string     `yaml:"repos"`
+	Repos   []RepoConfig `yaml:"repos"`
 	Sync    SyncConfig   `yaml:"sync"`
 	Server  ServerConfig `yaml:"server"`
 }
@@ -39,7 +63,7 @@ type Paths struct {
 func Default() *Config {
 	return &Config{
 		Version: configVersion,
-		Repos:   []string{},
+		Repos:   []RepoConfig{},
 		Sync: SyncConfig{
 			StaleDays:        14,
 			ReviewStaleDays:  3,
@@ -123,16 +147,14 @@ func (c *Config) Normalize() {
 		c.Version = configVersion
 	}
 	seen := make(map[string]struct{}, len(c.Repos))
-	repos := make([]string, 0, len(c.Repos))
+	repos := make([]RepoConfig, 0, len(c.Repos))
 	for _, repo := range c.Repos {
-		repo = strings.TrimSpace(repo)
-		repo = strings.TrimPrefix(repo, "https://github.com/")
-		repo = strings.TrimSuffix(repo, ".git")
-		repo = strings.Trim(repo, "/")
-		if repo == "" {
+		repo.Name = NormalizeRepoName(repo.Name)
+		repo.Branch = NormalizeBranchName(repo.Branch)
+		if repo.Name == "" {
 			continue
 		}
-		key := strings.ToLower(repo)
+		key := strings.ToLower(repo.Name)
 		if _, ok := seen[key]; ok {
 			continue
 		}
@@ -165,9 +187,11 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("不支持的配置版本 %d，当前支持 %d", c.Version, configVersion)
 	}
 	for _, repo := range c.Repos {
-		parts := strings.Split(repo, "/")
-		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
-			return fmt.Errorf("仓库格式应为 owner/name: %q", repo)
+		if _, _, err := SplitRepo(repo.Name); err != nil {
+			return err
+		}
+		if err := ValidateBranchName(repo.Branch); err != nil {
+			return fmt.Errorf("仓库 %s 的追踪分支无效: %w", repo.Name, err)
 		}
 	}
 	if c.Server.Port < 1 || c.Server.Port > 65535 {
@@ -182,6 +206,38 @@ func SplitRepo(fullName string) (string, string, error) {
 		return "", "", fmt.Errorf("无效仓库名: %q", fullName)
 	}
 	return parts[0], parts[1], nil
+}
+
+func NormalizeRepoName(fullName string) string {
+	fullName = strings.TrimSpace(fullName)
+	fullName = strings.TrimPrefix(fullName, "https://github.com/")
+	fullName = strings.TrimPrefix(fullName, "http://github.com/")
+	fullName = strings.TrimPrefix(fullName, "github.com/")
+	fullName = strings.TrimPrefix(fullName, "git@github.com:")
+	fullName = strings.TrimSuffix(fullName, ".git")
+	return strings.Trim(fullName, "/")
+}
+
+func NormalizeBranchName(branch string) string {
+	branch = strings.TrimSpace(branch)
+	branch = strings.TrimPrefix(branch, "refs/heads/")
+	return strings.Trim(branch, "/")
+}
+
+func ValidateBranchName(branch string) error {
+	if branch == "" {
+		return nil
+	}
+	if strings.ContainsAny(branch, " \t\r\n\\") {
+		return errors.New("分支名不能包含空白或反斜杠")
+	}
+	if strings.Contains(branch, "..") || strings.Contains(branch, "@{") {
+		return errors.New("分支名包含无效字符")
+	}
+	if strings.HasPrefix(branch, "-") || strings.HasSuffix(branch, ".") {
+		return errors.New("分支名不能以 - 开头或以 . 结尾")
+	}
+	return nil
 }
 
 func expandHome(path string) (string, error) {

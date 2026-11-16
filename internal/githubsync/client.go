@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/cli/go-gh/v2/pkg/api"
+	"github.com/xiaoyumuxi/gh-manager/internal/config"
 	"github.com/xiaoyumuxi/gh-manager/internal/store"
 )
 
@@ -145,8 +147,41 @@ query($owner: String!, $first: Int!, $after: String) {
   }
 }`
 
+const repositoryDefaultHeadQuery = `
+query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    defaultBranchRef {
+      name
+      target {
+        __typename
+        ... on Commit { oid messageHeadline committedDate }
+      }
+    }
+  }
+}`
+
+const repositoryBranchHeadQuery = `
+query($owner: String!, $name: String!, $qualifiedName: String!) {
+  repository(owner: $owner, name: $name) {
+    ref(qualifiedName: $qualifiedName) {
+      name
+      target {
+        __typename
+        ... on Commit { oid messageHeadline committedDate }
+      }
+    }
+  }
+}`
+
 type Client struct {
 	graphql *api.GraphQLClient
+}
+
+type RepoHead struct {
+	Branch      string
+	SHA         string
+	Message     string
+	CommittedAt time.Time
 }
 
 type pageInfo struct {
@@ -264,6 +299,25 @@ type ownerReposResponse struct {
 	} `json:"repositoryOwner"`
 }
 
+type branchTarget struct {
+	TypeName        string `json:"__typename"`
+	OID             string `json:"oid"`
+	MessageHeadline string `json:"messageHeadline"`
+	CommittedDate   string `json:"committedDate"`
+}
+
+type branchRef struct {
+	Name   string        `json:"name"`
+	Target *branchTarget `json:"target"`
+}
+
+type repositoryHeadResponse struct {
+	Repository *struct {
+		DefaultBranchRef *branchRef `json:"defaultBranchRef"`
+		Ref              *branchRef `json:"ref"`
+	} `json:"repository"`
+}
+
 func NewClient() (*Client, error) {
 	client, err := api.DefaultGraphQLClient()
 	if err != nil {
@@ -339,6 +393,58 @@ func (c *Client) listPullRequests(ctx context.Context, owner, name string, first
 		}
 		variables["after"] = response.Repository.PullRequests.PageInfo.EndCursor
 	}
+}
+
+func GetRepositoryHead(ctx context.Context, fullName, branch string) (RepoHead, error) {
+	owner, name, err := config.SplitRepo(fullName)
+	if err != nil {
+		return RepoHead{}, err
+	}
+	client, err := NewClient()
+	if err != nil {
+		return RepoHead{}, err
+	}
+	return client.repositoryHead(ctx, owner, name, config.NormalizeBranchName(branch))
+}
+
+func (c *Client) repositoryHead(ctx context.Context, owner, name, branch string) (RepoHead, error) {
+	query := repositoryDefaultHeadQuery
+	variables := map[string]any{"owner": owner, "name": name}
+	if branch != "" {
+		query = repositoryBranchHeadQuery
+		variables["qualifiedName"] = "refs/heads/" + branch
+	}
+
+	var response repositoryHeadResponse
+	if err := c.graphql.DoWithContext(ctx, query, variables, &response); err != nil {
+		return RepoHead{}, err
+	}
+	if response.Repository == nil {
+		return RepoHead{}, fmt.Errorf("仓库不存在或无权限访问: %s/%s", owner, name)
+	}
+
+	ref := response.Repository.DefaultBranchRef
+	if branch != "" {
+		ref = response.Repository.Ref
+		if ref == nil {
+			return RepoHead{}, fmt.Errorf("分支 %q 不存在: %s/%s", branch, owner, name)
+		}
+	} else if ref == nil {
+		return RepoHead{}, fmt.Errorf("仓库没有默认分支（可能是空仓库）: %s/%s", owner, name)
+	}
+	if ref.Target == nil || strings.TrimSpace(ref.Target.OID) == "" {
+		return RepoHead{}, fmt.Errorf("分支 %q 尚无提交: %s/%s", ref.Name, owner, name)
+	}
+	committedAt, err := parseGitHubTime(ref.Target.CommittedDate)
+	if err != nil || committedAt.IsZero() {
+		return RepoHead{}, fmt.Errorf("无法读取分支 %q 的最新提交时间: %s/%s", ref.Name, owner, name)
+	}
+	return RepoHead{
+		Branch:      ref.Name,
+		SHA:         ref.Target.OID,
+		Message:     ref.Target.MessageHeadline,
+		CommittedAt: committedAt.UTC(),
+	}, nil
 }
 
 func ListRepositories(ctx context.Context, owner string) ([]string, error) {
