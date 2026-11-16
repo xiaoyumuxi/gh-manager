@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>GH Manager · GitHub 工作台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%233370ff'/%3E%3Cpath d='M8 20.5h4v4H8zM14 14h4v10.5h-4zM20 8h4v16.5h-4z' fill='white'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="app-header">
+    <a class="brand" href="/" aria-label="GH Manager 首页">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32"><rect width="32" height="32" rx="9" fill="currentColor"/><path d="M8 20.5h4v4H8zM14 14h4v10.5h-4zM20 8h4v16.5h-4z" fill="white"/></svg>
+      </span>
+      <span class="brand-copy">
+        <strong>GH Manager</strong>
+        <small>GitHub issue &amp; PR workspace</small>
+      </span>
+    </a>
+    <div class="header-actions">
+      <div class="sync-state" id="syncState" title="同步状态">
+        <span class="sync-dot" id="syncDot" aria-hidden="true"></span>
+        <span id="syncText">正在读取工作区...</span>
+      </div>
+      <button class="button button-primary" id="syncButton" type="button">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15.8 8A6 6 0 1 0 16 11.6M15.8 8V3.8M15.8 8h-4.2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>同步 GitHub</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="page">
+    <section class="intro">
+      <div>
+        <p class="eyebrow">WORKSPACE</p>
+        <h1>把散落在仓库里的待办，收进一张表。</h1>
+        <p class="intro-text" id="workspaceMeta">正在加载仓库与同步状态...</p>
+      </div>
+      <div class="intro-note">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.8 3.5 6v4.2c0 3.7 2.7 6.2 6.5 7 3.8-.8 6.5-3.3 6.5-7V6L10 2.8Z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m7.4 10 1.7 1.7 3.6-3.8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>GitHub 数据只读同步；标签和自定义字段仅保存在本机。</span>
+      </div>
+    </section>
+
+    <section class="stats-grid" id="statsGrid" aria-label="统计数据">
+      <div class="stat-card stat-loading"></div>
+      <div class="stat-card stat-loading"></div>
+      <div class="stat-card stat-loading"></div>
+      <div class="stat-card stat-loading"></div>
+      <div class="stat-card stat-loading"></div>
+      <div class="stat-card stat-loading"></div>
+    </section>
+
+    <section class="board">
+      <div class="toolbar">
+        <label class="search-box">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.8" cy="8.8" r="5.3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m13 13 4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          <input id="searchInput" type="search" placeholder="搜索标题、仓库、编号、作者或标签" autocomplete="off">
+          <kbd>/</kbd>
+        </label>
+        <label class="field-inline">
+          <span>状态</span>
+          <select id="stateFilter">
+            <option value="">全部</option>
+            <option value="open">打开中</option>
+            <option value="closed">已关闭 / 合并</option>
+          </select>
+        </label>
+        <label class="field-inline">
+          <span>类型</span>
+          <select id="kindFilter">
+            <option value="">全部</option>
+            <option value="issue">Issue</option>
+            <option value="pr">Pull Request</option>
+          </select>
+        </label>
+        <label class="field-inline">
+          <span>标签</span>
+          <select id="tagFilter">
+            <option value="">全部</option>
+          </select>
+        </label>
+        <label class="toggle">
+          <input id="staleFilter" type="checkbox">
+          <span>仅看停滞</span>
+        </label>
+        <button class="button button-quiet filter-reset" id="resetFilters" type="button" hidden>清除筛选</button>
+        <span class="toolbar-spacer"></span>
+        <button class="button button-quiet" id="manageTags" type="button">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5.5h8.2l5.3 5.2-6 6-5.3-5.3V5.5Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><circle cx="7" cy="8.5" r="1.2" fill="currentColor"/></svg>
+          标签
+        </button>
+        <button class="button button-quiet" id="manageFields" type="button">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 5.5h13M3.5 10h13M3.5 14.5h8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          字段
+        </button>
+      </div>
+
+      <div class="table-scroller" id="tableScroller">
+        <table class="data-table" id="dataTable">
+          <thead id="tableHead"></thead>
+          <tbody id="tableBody"></tbody>
+        </table>
+      </div>
+
+      <footer class="board-footer">
+        <span id="resultCount">正在加载...</span>
+        <span class="footer-rule"></span>
+        <span id="lastSyncDetail">尚未同步</span>
+        <span class="toolbar-spacer"></span>
+        <span class="local-badge">
+          <span class="local-dot"></span>
+          本地数据库
+        </span>
+      </footer>
+    </section>
+  </main>
+
+  <div class="popover" id="popover" hidden></div>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+  <dialog class="dialog" id="tagsDialog">
+    <div class="dialog-card">
+      <header class="dialog-header">
+        <div>
+          <p class="eyebrow">LOCAL TAGS</p>
+          <h2>管理本地标签</h2>
+        </div>
+        <button class="icon-button dialog-close" type="button" data-close-dialog="tagsDialog" aria-label="关闭">
+          <svg viewBox="0 0 20 20"><path d="m5 5 10 10M15 5 5 15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        </button>
+      </header>
+      <form class="compact-form" id="tagCreateForm">
+        <label class="field-inline grow">
+          <span>新标签</span>
+          <input id="newTagName" type="text" maxlength="24" placeholder="例如：等待设计确认" required>
+        </label>
+        <label class="color-field" title="标签颜色">
+          <input id="newTagColor" type="color" value="#3370FF">
+        </label>
+        <button class="button button-primary" type="submit">添加</button>
+      </form>
+      <div class="dialog-list" id="tagManageList"></div>
+    </div>
+  </dialog>
+
+  <dialog class="dialog" id="fieldsDialog">
+    <div class="dialog-card">
+      <header class="dialog-header">
+        <div>
+          <p class="eyebrow">CUSTOM FIELDS</p>
+          <h2>自定义字段</h2>
+        </div>
+        <button class="icon-button dialog-close" type="button" data-close-dialog="fieldsDialog" aria-label="关闭">
+          <svg viewBox="0 0 20 20"><path d="m5 5 10 10M15 5 5 15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        </button>
+      </header>
+      <form id="fieldCreateForm" class="field-form">
+        <div class="form-grid">
+          <label class="stack-field">
+            <span>字段名称</span>
+            <input id="newFieldName" type="text" maxlength="60" placeholder="例如：下一步动作" required>
+          </label>
+          <label class="stack-field">
+            <span>字段类型</span>
+            <select id="newFieldType">
+              <option value="text">文本</option>
+              <option value="long_text">长文本</option>
+              <option value="number">数字</option>
+              <option value="select">单选</option>
+              <option value="multi_select">多选</option>
+              <option value="date">日期</option>
+              <option value="checkbox">复选框</option>
+              <option value="url">URL</option>
+            </select>
+          </label>
+        </div>
+        <label class="stack-field" id="fieldOptionsWrap" hidden>
+          <span>选项</span>
+          <textarea id="newFieldOptions" rows="2" placeholder="使用逗号或换行分隔，例如：待确认, 已排期, 已完成"></textarea>
+        </label>
+        <div class="form-actions">
+          <span class="form-hint">字段会立即出现在表格中。</span>
+          <button class="button button-primary" type="submit">创建字段</button>
+        </div>
+      </form>
+      <div class="dialog-section-title">已有字段</div>
+      <div class="dialog-list" id="fieldManageList"></div>
+    </div>
+  </dialog>
+</body>
+</html>

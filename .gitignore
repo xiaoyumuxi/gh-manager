@@ -1,0 +1,7 @@
+/gh-pulse
+/gh-manager
+/dist/
+*.db
+*.db-wal
+*.db-shm
+.DS_Store

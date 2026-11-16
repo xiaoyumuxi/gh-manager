@@ -1,0 +1,43 @@
+version: 2
+
+project_name: gh-manager
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: gh-manager
+    main: .
+    binary: gh-manager
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/xiaoyumuxi/gh-manager/cmd.version={{.Version}}
+      - -X github.com/xiaoyumuxi/gh-manager/cmd.commit={{.Commit}}
+      - -X github.com/xiaoyumuxi/gh-manager/cmd.date={{.Date}}
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
